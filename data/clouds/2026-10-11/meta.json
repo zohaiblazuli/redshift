@@ -1,0 +1,23 @@
+{
+  "date": "2026-10-11",
+  "sources": [
+    "VIIRS_NOAA20_Cloud_Top_Height_Day",
+    "VIIRS_SNPP_Cloud_Top_Height_Day",
+    "MODIS_Aqua_Cloud_Top_Height_Day",
+    "MODIS_Terra_Cloud_Top_Height_Day",
+    "VIIRS_NOAA20_Cloud_Top_Height_Night",
+    "MODIS_Aqua_Cloud_Top_Height_Night",
+    "VIIRS_NOAA20_Cloud_Optical_Thickness",
+    "VIIRS_SNPP_Cloud_Optical_Thickness",
+    "MODIS_Aqua_Cloud_Optical_Thickness",
+    "MODIS_Terra_Cloud_Optical_Thickness",
+    "MODIS_Aqua_Cloud_Phase_Optical_Properties",
+    "MODIS_Terra_Cloud_Phase_Optical_Properties",
+    "VIIRS_NOAA20_CorrectedReflectance_TrueColor",
+    "VIIRS_SNPP_CorrectedReflectance_TrueColor",
+    "VIIRS_NOAA20_NDSI_Snow_Cover",
+    "BlueMarble_NextGeneration"
+  ],
+  "cloudFraction": 0.4688555598258972,
+  "retrievalCloudyFraction": 0.8026175498962402
+}

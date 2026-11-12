@@ -1,0 +1,25 @@
+# Downloaded map and elevation tiles
+tilecache/
+
+# JavaScript dependencies and logs
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# Test and coverage output
+coverage/
+playwright-report/
+test-results/
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+

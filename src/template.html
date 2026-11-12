@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SPHEREx Orbit</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Ccircle cx=%2216%22 cy=%2216%22 r=%2213%22 fill=%22%231d4f8a%22/%3E%3Cpath d=%22M10 8h12l-3 12h-6z%22 fill=%22%23eee%22/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --fg: rgba(236, 240, 246, 0.92);
+    --dim: rgba(220, 228, 240, 0.55);
+    --faint: rgba(220, 228, 240, 0.22);
+    --accent: #7fc4ff;
+    --warn: #ffb347;
+    --panel: rgba(6, 10, 18, 0.38);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; color: var(--fg); font-family: Inter, system-ui, sans-serif; }
+  #app canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  #app canvas:active { cursor: grabbing; }
+  .hud { position: fixed; pointer-events: none; transition: opacity .4s; }
+  body.nohud .hud { opacity: 0; }
+  .mono { font-family: 'IBM Plex Mono', ui-monospace, monospace; }
+
+  #brand { top: 22px; left: 26px; }
+  #brand .name { font-weight: 600; letter-spacing: .32em; font-size: 15px; }
+  #brand .sub { margin-top: 5px; font-size: 10.5px; color: var(--dim); letter-spacing: .04em; max-width: 420px; line-height: 1.45; }
+  #brand .live { display: inline-flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 10px; letter-spacing: .2em; color: var(--dim); }
+  #brand .live i { width: 6px; height: 6px; border-radius: 50%; background: #ff4d4d; box-shadow: 0 0 8px #ff4d4d; animation: blink 1.6s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+
+  #modes { top: 22px; right: 26px; text-align: right; font-size: 10.5px; letter-spacing: .18em; color: var(--dim); }
+  #modes b { display: block; color: var(--fg); font-weight: 500; font-size: 12px; margin-bottom: 4px; }
+  #modes div + div { margin-top: 12px; }
+
+  #telemetry { left: 26px; bottom: 24px; padding: 14px 16px 12px; background: var(--panel); border: 1px solid var(--faint); border-radius: 4px; backdrop-filter: blur(6px); }
+  #telemetry table { border-collapse: collapse; font-size: 11.5px; }
+  #telemetry td { padding: 2px 0; }
+  #telemetry td:first-child { color: var(--dim); letter-spacing: .14em; font-size: 9.5px; padding-right: 22px; }
+  #telemetry td.warn, #telemetry span.warn { color: var(--warn); }
+  #telemetry .sep td { padding-top: 7px; border-top: 1px solid var(--faint); }
+
+  #status { right: 26px; bottom: 24px; text-align: right; font-size: 10px; letter-spacing: .16em; color: var(--dim); }
+  #status div { margin-top: 4px; }
+  #tiles.busy { color: var(--accent); }
+  #status .keyhint { margin-top: 10px; color: var(--fg); }
+  #status kbd, #help kbd { font-family: 'IBM Plex Mono', monospace; font-size: 10px; border: 1px solid var(--faint); border-radius: 3px; padding: 1px 5px; margin: 0 2px; color: var(--fg); }
+
+  #attrib { left: 50%; bottom: 8px; transform: translateX(-50%); font-size: 9px; color: rgba(220,228,240,.35); letter-spacing: .04em; white-space: nowrap; }
+
+  #toast { position: fixed; left: 50%; top: 16%; transform: translate(-50%, 8px); opacity: 0; pointer-events: none; transition: opacity .35s, transform .35s; font-size: 12px; letter-spacing: .22em; text-transform: uppercase; text-shadow: 0 1px 8px rgba(0,0,0,.6); }
+  #toast.show { opacity: 1; transform: translate(-50%, 0); }
+  #toast.big { font-size: 20px; letter-spacing: .3em; font-weight: 500; }
+
+  #help { position: fixed; right: 26px; top: 50%; transform: translate(20px, -50%); opacity: 0; pointer-events: none; transition: opacity .3s, transform .3s; width: 330px; padding: 18px 20px; background: rgba(6, 10, 18, 0.72); border: 1px solid var(--faint); border-radius: 6px; backdrop-filter: blur(10px); font-size: 12px; line-height: 1.75; }
+  #help.open { opacity: 1; transform: translate(0, -50%); pointer-events: auto; }
+  #help h3 { margin: 0 0 6px; font-size: 10px; letter-spacing: .24em; color: var(--dim); font-weight: 500; }
+  #help h3:not(:first-child) { margin-top: 14px; }
+  #help .row { display: flex; justify-content: space-between; gap: 10px; }
+  #help .row span:last-child { color: var(--dim); text-align: right; }
+  #help ul { list-style: none; margin: 0; padding: 0; columns: 2; column-gap: 12px; font-size: 11px; }
+  #help li { break-inside: avoid; color: var(--dim); }
+
+  #plan { position: fixed; left: 50%; top: 50%; transform: translate(-50%, calc(-50% + 14px)); opacity: 0; pointer-events: none; transition: opacity .3s, transform .3s; width: 400px; max-width: calc(100vw - 32px); padding: 18px 20px; background: rgba(6, 10, 18, 0.78); border: 1px solid var(--faint); border-radius: 6px; backdrop-filter: blur(10px); font-size: 11.5px; line-height: 1.6; z-index: 5; }
+  #plan.open { opacity: 1; transform: translate(-50%, -50%); pointer-events: auto; }
+  #plan h3 { margin: 0 0 4px; font-size: 10px; letter-spacing: .24em; color: var(--dim); font-weight: 500; }
+  #plan .sub { color: var(--dim); font-size: 10.5px; margin-bottom: 12px; font-family: Inter, system-ui, sans-serif; }
+  #plan table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+  #plan td { padding: 2px 0; }
+  #plan td:first-child { color: var(--dim); letter-spacing: .14em; font-size: 9.5px; width: 104px; }
+  #plan .opts { display: flex; gap: 6px; flex-wrap: wrap; }
+  #plan button { font: inherit; font-size: 10.5px; letter-spacing: .08em; color: var(--fg); background: rgba(255,255,255,.04); border: 1px solid var(--faint); border-radius: 3px; padding: 5px 10px; cursor: pointer; }
+  #plan button:hover:not(:disabled) { border-color: var(--dim); }
+  #plan button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  #plan button.on { border-color: var(--accent); color: var(--accent); }
+  #plan button.primary { border-color: var(--accent); background: rgba(127,196,255,.12); }
+  #plan button:disabled { opacity: .4; cursor: default; }
+  #plan .setting { margin-top: 11px; }
+  #plan .setting-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 6px; color: var(--dim); font-size: 9.5px; letter-spacing: .14em; }
+  #plan .setting-head output { color: var(--fg); font-size: 10px; letter-spacing: .04em; text-align: right; }
+  #plan input[type="range"] { --fill: 0%; display: block; width: 100%; height: 22px; margin: 0; appearance: none; background: transparent; cursor: ew-resize; }
+  #plan input[type="range"]::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: linear-gradient(90deg, var(--accent) 0 var(--fill), var(--faint) var(--fill) 100%); }
+  #plan input[type="range"]::-webkit-slider-thumb { width: 14px; height: 14px; margin-top: -5.5px; appearance: none; border: 2px solid #09111d; border-radius: 50%; background: var(--accent); box-shadow: 0 2px 7px rgba(0,0,0,.55); }
+  #plan input[type="range"]::-moz-range-track { height: 3px; border: 0; border-radius: 2px; background: var(--faint); }
+  #plan input[type="range"]::-moz-range-progress { height: 3px; border-radius: 2px; background: var(--accent); }
+  #plan input[type="range"]::-moz-range-thumb { width: 11px; height: 11px; border: 2px solid #09111d; border-radius: 50%; background: var(--accent); box-shadow: 0 2px 7px rgba(0,0,0,.55); }
+  #plan input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 2px; }
+  #plan .range-scale { display: flex; justify-content: space-between; margin-top: -3px; color: rgba(220,228,240,.42); font-size: 8.5px; letter-spacing: .05em; }
+  #plan .setting-note { margin-top: 8px; color: var(--dim); font: 9.5px/1.5 Inter, system-ui, sans-serif; }
+  #plan .bar { height: 2px; background: var(--faint); margin: 4px 0 8px; overflow: hidden; }
+  #p-bar { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #p-msg { min-height: 18px; color: var(--dim); font-size: 10.5px; margin-bottom: 10px; }
+
+  #loader { position: fixed; inset: 0; background: #000; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; z-index: 10; transition: opacity 1.2s ease .3s; }
+  #loader.done { opacity: 0; pointer-events: none; }
+  #loader .name { font-weight: 600; letter-spacing: .5em; font-size: 22px; padding-left: .5em; }
+  #loader .msg { font-size: 10.5px; letter-spacing: .3em; color: var(--dim); }
+  #loader .bar { width: 220px; height: 1px; background: var(--faint); overflow: hidden; }
+  #loadbar { height: 100%; width: 0; background: var(--fg); transition: width .3s; }
+
+  @media (max-width: 720px) {
+    #brand .sub, #status .keyhint, #attrib { display: none; }
+    #telemetry { left: 12px; bottom: 12px; padding: 10px 12px; }
+    #brand { left: 16px; top: 16px; } #modes { right: 16px; top: 16px; } #status { right: 16px; bottom: 12px; }
+    #help { right: 12px; left: 12px; width: auto; }
+  }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div id="loader">
+  <div class="name">SPHEREX</div>
+  <div class="bar"><div id="loadbar"></div></div>
+  <div class="msg mono">ACQUIRING DOWNLINK</div>
+</div>
+
+<div id="brand" class="hud">
+  <div class="name">SPHEREX</div>
+  <div class="sub">Spectro-Photometer for the History of the Universe, Epoch of Reionization and Ices Explorer</div>
+  <div class="live mono"><i></i>LIVE · LOW EARTH ORBIT</div>
+</div>
+
+<div id="modes" class="hud mono">
+  <div><b id="cam-mode">—</b>CAMERA</div>
+  <div><b id="att-mode">—</b>ATTITUDE</div>
+</div>
+
+<div id="telemetry" class="hud mono">
+  <table>
+    <tr><td>ALTITUDE</td><td id="t-alt">—</td></tr>
+    <tr><td>VELOCITY</td><td id="t-vel">—</td></tr>
+    <tr><td>PERIOD</td><td id="t-period">—</td></tr>
+    <tr><td>HEADING</td><td id="t-hdg">—</td></tr>
+    <tr class="sep"><td>LATITUDE</td><td id="t-lat">—</td></tr>
+    <tr><td>LONGITUDE</td><td id="t-lon">—</td></tr>
+    <tr class="sep"><td>LOCAL SOLAR</td><td id="t-lst">—</td></tr>
+    <tr><td>MISSION</td><td id="t-utc">—</td></tr>
+    <tr><td>ILLUMINATION</td><td><span id="t-sun">—</span></td></tr>
+    <tr><td>TIME WARP</td><td id="t-warp">—</td></tr>
+  </table>
+</div>
+
+<div id="status" class="hud mono">
+  <div id="tiles">—</div>
+  <div id="fps">—</div>
+  <div class="keyhint">Drag to look · <kbd>C</kbd> camera · <kbd>L</kbd> flight plan · <kbd>?</kbd> controls</div>
+</div>
+
+<div id="attrib" class="hud">Imagery: Sentinel-2 cloudless 2020 by EOX (CC BY-NC-SA 4.0, contains modified Copernicus Sentinel data) · Elevation: Mapzen/AWS Terrain Tiles · Clouds: NASA GIBS (VIIRS/MODIS, 2026-10-11) · Night lights: NASA Visible Earth</div>
+
+<div id="toast" class="mono"></div>
+
+<div id="plan" class="mono">
+  <h3>FLIGHT PLAN</h3>
+  <div class="sub">Downloads the ground imagery and terrain for the orbit ahead. Clouds and their ground shadows are generated only inside this active flight corridor to keep GPU use bounded.</div>
+  <div class="opts" id="plan-len">
+    <button data-orbits="0.25">¼ orbit</button><button data-orbits="0.5">½ orbit</button><button data-orbits="1" class="on">1 orbit</button><button data-orbits="3">3 orbits</button>
+  </div>
+  <div class="setting">
+    <div class="setting-head"><label for="ground-resolution">GROUND RESOLUTION</label><output id="p-ground-res" for="ground-resolution">—</output></div>
+    <input id="ground-resolution" type="range" min="50" max="100" step="1" value="100">
+    <div class="range-scale" aria-hidden="true"><span>50%</span><span>100%</span></div>
+  </div>
+  <div class="setting">
+    <div class="setting-head"><label for="cloud-resolution">CLOUD RESOLUTION</label><output id="p-cloud-res" for="cloud-resolution">—</output></div>
+    <input id="cloud-resolution" type="range" min="25" max="100" step="1" value="38">
+    <div class="range-scale" aria-hidden="true"><span>25%</span><span>100%</span></div>
+  </div>
+  <div class="setting-note">Percentages are relative to the window. The final compositor follows the higher setting.</div>
+  <table>
+    <tr><td>TRACK</td><td id="p-track">—</td></tr>
+    <tr><td>CLOUDS</td><td>active path · 840 km corridor</td></tr>
+    <tr><td>TILES</td><td id="p-tiles">—</td></tr>
+    <tr><td>DOWNLOAD</td><td id="p-size">—</td></tr>
+    <tr><td>DISK CACHE</td><td id="p-cache">—</td></tr>
+  </table>
+  <div class="bar"><div id="p-bar"></div></div>
+  <div id="p-msg"></div>
+  <div class="opts"><button id="p-dl" class="primary" disabled>Download</button><button id="p-fly">Fly ▸</button><button id="p-clear">Clear cache</button></div>
+</div>
+
+<div id="help" class="mono">
+  <h3>SPACECRAFT</h3>
+  <div class="row"><span><kbd>W</kbd><kbd>S</kbd></span><span>orbital speed</span></div>
+  <div class="row"><span><kbd>A</kbd><kbd>D</kbd></span><span>turn ground track</span></div>
+  <div class="row"><span><kbd>R</kbd><kbd>F</kbd></span><span>raise / lower orbit</span></div>
+  <div class="row"><span><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd><kbd>Q</kbd><kbd>E</kbd></span><span>rotate spacecraft</span></div>
+  <div class="row"><span><kbd>T</kbd> · <kbd>⌫</kbd></span><span>attitude mode · reset</span></div>
+  <div class="row"><span><kbd>O</kbd></span><span>restore orbital velocity</span></div>
+  <div class="row"><span><kbd>Shift</kbd></span><span>boost</span></div>
+  <h3>VIEW</h3>
+  <div class="row"><span><kbd>C</kbd> / <kbd>Shift C</kbd></span><span>cycle cameras</span></div>
+  <div class="row"><span>drag · wheel</span><span>look · zoom</span></div>
+  <div class="row"><span>free flight</span><span>WASD · Q/E · wheel speed</span></div>
+  <div class="row"><span><kbd>H</kbd></span><span>hide HUD</span></div>
+  <h3>WORLD</h3>
+  <div class="row"><span><kbd>[</kbd><kbd>]</kbd> · <kbd>N</kbd></span><span>time of day · sync to now</span></div>
+  <div class="row"><span><kbd>,</kbd><kbd>.</kbd> · <kbd>P</kbd></span><span>time warp · pause</span></div>
+  <div class="row"><span><kbd>-</kbd><kbd>=</kbd></span><span>cloud cover</span></div>
+  <div class="row"><span><kbd>Z</kbd></span><span>Blender clouds on/off</span></div>
+  <div class="row"><span><kbd>B</kbd></span><span>air haze strength</span></div>
+  <div class="row"><span><kbd>G</kbd><kbd>K</kbd></span><span>ground · cloud resolution</span></div>
+  <div class="row"><span><kbd>M</kbd></span><span>hi-res imagery</span></div>
+  <div class="row"><span><kbd>X</kbd></span><span>terrain relief ×1 (true) / ×1.6 / ×2.5</span></div>
+  <div class="row"><span><kbd>L</kbd></span><span>flight plan · offline tiles</span></div>
+  <h3>CAMERA</h3>
+  <div class="row"><span><kbd>;</kbd><kbd>'</kbd></span><span>exposure −/+ EV</span></div>
+  <div class="row"><span><kbd>U</kbd></span><span>auto exposure</span></div>
+  <div class="row"><span><kbd>J</kbd></span><span>lens flare</span></div>
+  <div class="row"><span><kbd>Y</kbd></span><span>tonemapper Catalyst/AgX punchy/AgX/ACES/Neutral</span></div>
+  <h3>DESTINATIONS</h3>
+  <ul id="places"></ul>
+</div>
+
+<script>
+  // Surface start-up failures on the loader instead of hanging silently.
+  (function () {
+    function fail(msg) {
+      var el = document.querySelector('#loader .msg');
+      if (el) { el.style.color = '#ffb347'; el.style.letterSpacing = '.08em'; el.style.maxWidth = '640px'; el.style.textAlign = 'center'; el.style.lineHeight = '1.6'; el.textContent = msg; }
+    }
+    window.__sxFail = fail;
+    window.addEventListener('error', function (e) { fail('Start-up error: ' + (e.message || e.type) + (e.filename ? ' (' + e.filename.split('/').pop() + ':' + e.lineno + ')' : '')); });
+    window.addEventListener('unhandledrejection', function (e) { fail('Start-up error: ' + (e.reason && e.reason.message || e.reason)); });
+    var c = document.createElement('canvas');
+    if (!c.getContext('webgl2')) setTimeout(function () { fail('WebGL 2 is not available in this browser. Enable hardware acceleration (chrome://settings/system) or try Chrome / Edge / Firefox.'); }, 0);
+    setTimeout(function () { if (!window.__sx) fail('Still waiting for the engine to start. Check your internet connection (three.js and imagery load from CDNs), then reload.'); }, 20000);
+  })();
+</script>
+<!-- BUNDLE -->
+</body>
+</html>

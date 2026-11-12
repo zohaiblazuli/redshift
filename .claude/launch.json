@@ -1,0 +1,7 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "openworld", "runtimeExecutable": "node", "runtimeArgs": ["server.js", "8080"], "port": 8080 },
+    { "name": "cloudworks", "runtimeExecutable": "python", "runtimeArgs": ["-m", "http.server", "8765", "--bind", "127.0.0.1", "--directory", "G:/Claude Windows/CloudWorks"], "port": 8765 }
+  ]
+}
