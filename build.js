@@ -1,22 +1,14 @@
 // Bundles src/*.js into a single self-contained index.html (works from file:// and from a server).
 // Usage: node build.js
-//
-// The cloud shapes come from the CloudWorks project (the source of truth for them): its shared
-// core module is bundled from ../CloudWorks/src/cloudcore.js (override with CLOUDWORKS=<dir>), and
-// its original cumulus volume is copied to data/cloudworks/ from the built groundview.html.
 const fs = require('fs');
 const path = require('path');
 
-const CLOUDWORKS = path.resolve(process.env.CLOUDWORKS || path.join(__dirname, '..', 'CloudWorks'));
-const sources = {
-  'cloudcore.js': path.join(CLOUDWORKS, 'src', 'cloudcore.js'),
-};
-const order = ['shaders.js', 'atmosphere.js', 'clouds.js', 'cloudmodels.js', 'earth.js', 'lighting.js', 'cloudslot.js', 'exampleclouds.js', 'regionclouds.js', 'cloudcore.js', 'cwstats.js', 'cwfar.js', 'cwclouds.js', 'textures.js', 'spherex.js', 'campose.js', 'sim.js', 'planner.js', 'flare10.js', 'lens.js', 'main.js'];
+const order = ['shaders.js', 'atmosphere.js', 'clouds.js', 'cloudmodels.js', 'earth.js', 'lighting.js', 'cloudslot.js', 'exampleclouds.js', 'regionclouds.js', 'photoclouds.js', 'citybounce.js', 'textures.js', 'spherex.js', 'campose.js', 'orbit.js', 'sim.js', 'planner.js', 'flare10.js', 'lens.js', 'grade.js', 'main.js'];
 const imports = new Set();
 let body = '';
 for (const f of order) {
-  const file = sources[f] || path.join(__dirname, 'src', f);
-  if (!fs.existsSync(file)) throw new Error(`${f} not found at ${file}` + (sources[f] ? ' (set CLOUDWORKS to the CloudWorks project folder)' : ''));
+  const file = path.join(__dirname, 'src', f);
+  if (!fs.existsSync(file)) throw new Error(`${f} not found at ${file}`);
   let src = fs.readFileSync(file, 'utf8');
   if (f === 'flare10.js') {
     const pack = fs.readFileSync(path.join(__dirname, 'data', 'flare10', 'catalyst.bin.gz'));
@@ -32,21 +24,19 @@ for (const f of order) {
 }
 const script = `<script type="module">\n${[...imports].join('\n')}\n${body}\n</script>`;
 const tpl = fs.readFileSync(path.join(__dirname, 'src', 'template.html'), 'utf8');
-fs.writeFileSync(path.join(__dirname, 'index.html'), tpl.replace('<!-- BUNDLE -->', () => script));
-console.log(`index.html built (${(script.length / 1024).toFixed(0)} KB of script; cloud core from ${CLOUDWORKS})`);
-
-// CloudWorks' original cumulus volume (432 x 304 x 328 bytes, gzip): served as a data file, loaded
-// by the cloud provider when the page is served (opened as a file, only the ten genera are used).
-const gv = path.join(CLOUDWORKS, 'groundview.html');
-const out = path.join(__dirname, 'data', 'cloudworks', 'legacy-cumulus.gz');
-if (fs.existsSync(gv)) {
-  const m = fs.readFileSync(gv, 'utf8').match(/const DENSITY_GZIP='([^']+)';/);
-  if (m) {
-    const bytes = Buffer.from(m[1], 'base64');
-    if (!fs.existsSync(out) || !fs.readFileSync(out).equals(bytes)) {
-      fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.writeFileSync(out, bytes);
-      console.log(`legacy cumulus volume updated (${(bytes.length / 1024).toFixed(0)} KB)`);
-    }
-  }
+// The photo clouds' layers (src/photoclouds.js, ~235 MB) start downloading from the head, before
+// the 2 MB script has even parsed (~1.5 s sooner); the provider then takes those responses.
+// Only when the page asks for the photo clouds (the default).
+const cloudDate = fs.readFileSync(path.join(__dirname, 'src', 'earth.js'), 'utf8').match(/CLOUD_DATE = '([\d-]+)'/)[1];
+const photoDir = path.join(__dirname, 'data', 'clouds', cloudDate, 'photo');
+let preload = '';
+if (fs.existsSync(path.join(photoDir, 'photo.json'))) {
+  const meta = JSON.parse(fs.readFileSync(path.join(photoDir, 'photo.json'), 'utf8'));
+  const urls = [...Array(meta.cols * meta.rows).keys()].map((i) => `data/clouds/${cloudDate}/photo/L${i}.bc4.gz`);
+  // plain fetch() calls kept in window.__pcPrefetch (not <link rel=preload>: Chrome failed to hand
+  // the 30 MB preloaded responses over to the page's fetch(), "Failed to fetch" for every layer)
+  preload = `<script>(function(){var c=new URLSearchParams(location.search).get('clouds');if(c&&c!=='photo')return;if(location.protocol.indexOf('http')!==0)return;` +
+    `var m=window.__pcPrefetch={};${JSON.stringify(urls)}.forEach(function(u){var p=fetch(u,{priority:'high'});p.catch(function(){});m[u]=p;});})();</script>`;
 }
+fs.writeFileSync(path.join(__dirname, 'index.html'), tpl.replace('<!-- PRELOAD -->', () => preload).replace('<!-- BUNDLE -->', () => script));
+console.log(`index.html built (${(script.length / 1024).toFixed(0)} KB of script)`);

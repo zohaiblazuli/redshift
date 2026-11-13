@@ -8,18 +8,21 @@ import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
 import { createWorld, R_EARTH, tileCache, CLOUDS_ENABLED, PROCEDURAL_CLOUDS, ATMOSPHERE_ENABLED } from './earth.js';
 import { CATALYST_SUN_TAN, SUN_DISC_TAN } from './earth.js';
-import { loadSphereX, HULL_CAMS } from './spherex.js';
-import { cameraPose, viewFromPose, makePose, makeView } from './campose.js';
+import { loadSphereX, HULL_CAMS, hdrResolve } from './spherex.js';
+import { RealOrbit, SurveyPointing, loadSpherexTle } from './orbit.js';
+import { cameraPose, viewFromPose, makePose, makeView, HERO, HERO_MODE } from './campose.js';
 import { Sim, PLACES } from './sim.js';
 import { CloudPass, CloudCompositePass } from './clouds.js';
 import { Lighting } from './lighting.js';
+import { createCityBounce } from './citybounce.js';
 import { CloudSlotPass, CloudSlotCompositePass } from './cloudslot.js';
 import { createExampleCloudProvider } from './exampleclouds.js';
 import { createRegionCloudProvider } from './regionclouds.js';
-import { createCloudWorksProvider } from './cwclouds.js';
+import { createPhotoCloudProvider } from './photoclouds.js';
 import { FlightPlanner } from './planner.js';
 import { AutoExposurePass, SunFlarePass, CatalystLensReflectionPass, ActionCamPass, loadCatalystLighting } from './lens.js';
 import { catalystLut, catalystLens } from './flare10.js';
+import { buildGradeLut, gradeLutGLSL, GRADE } from './grade.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -87,18 +90,118 @@ class SceneStagePass extends Pass {
     this.base = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType });
     this.sat = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, samples: 4 });
     this.comp = new FullScreenQuad(new THREE.ShaderMaterial({
-      uniforms: { tSat: { value: this.sat.texture } },
+      uniforms: { tSat: { value: this.sat.texture }, uTexel: { value: new THREE.Vector2(0.5, 0.5) }, uHdrK: hdrResolve.uHdrK },
       vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
-      fragmentShader: 'uniform sampler2D tSat; varying vec2 vUv; void main(){ gl_FragColor = texture2D(tSat, vUv); }',
+      // Crack fill: the model has pixel-wide gaps where separate meshes meet (panel frames, bus
+      // base, shield seams). Through them the planet behind showed as bright dots that flickered as
+      // the Earth moved past. A pixel the hull nearly surrounds (>= ~6 of 8 neighbours covered) is
+      // filled from its neighbours; silhouette edges have fewer covered neighbours and stay as they are.
+      fragmentShader: /* glsl */ `
+uniform sampler2D tSat; uniform vec2 uTexel; uniform float uHdrK; varying vec2 vUv;
+void main(){
+  vec4 c = texture2D(tSat, vUv);
+  if (c.a < 0.999) {
+    vec4 s = vec4(0.0);
+    for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {
+      if (i == 0 && j == 0) continue;
+      s += texture2D(tSat, vUv + vec2(float(i), float(j)) * uTexel);
+    }
+    float k = smoothstep(5.5, 7.5, s.a);
+    if (k > 0.0) c += (1.0 - c.a) * k * vec4(s.rgb / s.a, 1.0);
+  }
+  // undo the per-sample c / (1 + max(c)) the spacecraft materials write (spherex.js
+  // compressHdrOutput): the MSAA resolve averaged bounded values, so a lone sunlit sample on a
+  // thin edge no longer blows the whole pixel out
+  if (c.a > 0.0) {
+    vec3 u = c.rgb / c.a;
+    u /= 1.0 - min(uHdrK * max(max(u.r, u.g), u.b), 0.999);
+    c.rgb = u * c.a;
+  }
+  gl_FragColor = c;
+}`,
       depthTest: false, depthWrite: false, transparent: true,
       blending: THREE.CustomBlending, blendSrc: THREE.OneFactor, blendDst: THREE.OneMinusSrcAlphaFactor,
       blendSrcAlpha: THREE.ZeroFactor, blendDstAlpha: THREE.OneFactor,
+    }));
+
+    // Depth of field, focused on the spacecraft, applied to the planet layer alone before the
+    // spacecraft is composited over it (so the hull stays sharp, no halo at its edges).
+    // Progressive (user, 2026-11-14): the blur grows with distance -- the ground under the
+    // spacecraft is the least blurred, the horizon and the sky the most. (A real lens focused at
+    // ~15 m would blur all of it equally; this is a look, scaled by the lens: dofRadius = the
+    // A / s blur of a lens with aperture A at focus distance s, used at the far end.)
+    // Per-pixel radius from the planet layer's depth; disc (bokeh) gather at half resolution,
+    // golden-angle taps with a per-pixel rotation. The stars are drawn after the blur (starScene),
+    // hidden where the ground is in front: blurred, single-pixel stars would simply vanish.
+    this.dofRadius = 0;   // far-end blur radius, full-res px (set per frame in tick; 0 = off)
+    this.base.depthTexture = new THREE.DepthTexture(2, 2);
+    this.dofHalf = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType, depthBuffer: false });
+    this.dofOut = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType });
+    this.dofHalf.texture.minFilter = this.dofHalf.texture.magFilter = THREE.LinearFilter;
+    this.starScene = null; this.starCam = null; this.starUniforms = null;   // set after construction
+    this.dofU = {
+      tBase: { value: this.base.texture }, tDepth: { value: this.base.depthTexture }, tBlur: { value: this.dofHalf.texture },
+      uTexel: { value: new THREE.Vector2() }, uNear: { value: 1 }, uFar: { value: 2 }, uTanV: { value: 0.5 }, uAspect: { value: 1 },
+      uDNear: { value: 600 }, uDFar: { value: 3000 }, uRMin: { value: 0 }, uRMax: { value: 0 },
+    };
+    const quadVert = 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }';
+    const cocGlsl = /* glsl */ `
+uniform sampler2D tDepth; uniform float uNear, uFar, uTanV, uAspect, uDNear, uDFar, uRMin, uRMax;
+// blur radius (full-res px) for the planet-layer pixel at uv: distance from the camera (km), from
+// the ground under the spacecraft (uDNear) to the horizon (uDFar); no depth = sky = the far end
+float coc(vec2 uv){
+  float d = texture2D(tDepth, uv).r;
+  if (d >= 1.0) return uRMax;
+  float viewZ = (uNear * uFar) / ((uFar - uNear) * d - uFar);
+  vec2 ndc = uv * 2.0 - 1.0;
+  float dist = -viewZ * length(vec3(ndc.x * uTanV * uAspect, ndc.y * uTanV, 1.0));
+  float t = clamp((dist - uDNear) / max(uDFar - uDNear, 1.0), 0.0, 1.0);
+  return mix(uRMin, uRMax, t);
+}`;
+    this.dofBlur = new FullScreenQuad(new THREE.ShaderMaterial({
+      uniforms: this.dofU,
+      vertexShader: quadVert,
+      fragmentShader: /* glsl */ `
+uniform sampler2D tBase; uniform vec2 uTexel; varying vec2 vUv;
+${cocGlsl}
+const int N = 64;
+void main(){
+  float radius = coc(vUv);
+  // per-pixel rotation of the tap pattern (interleaved gradient noise): no ring pattern on point lights
+  float rot = 6.2831853 * fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+  vec3 s = vec3(0.0);
+  for (int i = 0; i < N; i++) {
+    float r = sqrt((float(i) + 0.5) / float(N)) * radius;
+    float a = float(i) * 2.39996323 + rot;
+    s += texture2D(tBase, vUv + vec2(cos(a), sin(a)) * r * uTexel).rgb;
+  }
+  gl_FragColor = vec4(s / float(N), 1.0);
+}`,
+      depthTest: false, depthWrite: false,
+    }));
+    this.dofMix = new FullScreenQuad(new THREE.ShaderMaterial({
+      uniforms: this.dofU,
+      vertexShader: quadVert,
+      fragmentShader: /* glsl */ `
+uniform sampler2D tBase, tBlur; varying vec2 vUv;
+${cocGlsl}
+void main(){
+  // below ~1 px the sharp layer is the right answer; fade in the blur over the first 2 px
+  gl_FragColor = vec4(mix(texture2D(tBase, vUv).rgb, texture2D(tBlur, vUv).rgb, smoothstep(0.5, 2.0, coc(vUv))), 1.0);
+}`,
+      depthTest: false, depthWrite: false,
     }));
   }
 
   setSize(w, h) {
     this.base.setSize(w, h);
     this.sat.setSize(w, h);
+    const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1);
+    this.dofHalf.setSize(hw, hh);
+    this.dofOut.setSize(w, h);
+    this.dofU.uTexel.value.set(1 / w, 1 / h);   // radius is given in full-res px
+    if (this.starUniforms) this.starUniforms.uRes.value.set(w, h);
+    this.comp.material.uniforms.uTexel.value.set(1 / w, 1 / h);
     for (const p of this.planetPasses) p.setSize(w, h);
     this.satPass.setSize(w, h);
     this.last.setSize(w, h);
@@ -106,22 +209,43 @@ class SceneStagePass extends Pass {
 
   render(renderer, writeBuffer, readBuffer, dt, maskActive) {
     for (const p of this.planetPasses) if (p.enabled) p.render(renderer, writeBuffer, this.base, dt, maskActive);
+    let scene = this.base;
+    const blur = this.dofRadius > 0.5;
+    if (blur) {
+      renderer.setRenderTarget(this.dofHalf);
+      this.dofBlur.render(renderer);
+      renderer.setRenderTarget(this.dofOut);
+      this.dofMix.render(renderer);
+      scene = this.dofOut;
+    }
+    if (this.starScene) {
+      // sharp stars over the (blurred) sky. Into the planet layer itself its own depth buffer hides
+      // them behind the ground; into dofOut they test the planet layer's depth texture instead
+      // (sampling a texture attached to the bound framebuffer is not allowed)
+      this.starUniforms.uUseDepth.value = blur ? 1 : 0;
+      this.starUniforms.tDepth.value = blur ? this.base.depthTexture : null;   // never bound while drawing into base
+      const ac = renderer.autoClear;
+      renderer.autoClear = false;
+      renderer.setRenderTarget(scene);
+      renderer.render(this.starScene, this.starCam);
+      renderer.autoClear = ac;
+    }
     if (this.satPass.enabled) {
       this.satPass.render(renderer, writeBuffer, this.sat, dt, maskActive);
       const ac = renderer.autoClear;
       renderer.autoClear = false;   // blend over the planet, don't clear it
-      renderer.setRenderTarget(this.base);
+      renderer.setRenderTarget(scene);
       this.comp.render(renderer);
       renderer.autoClear = ac;
     }
-    this.last.render(renderer, writeBuffer, this.base, dt, maskActive);
+    this.last.render(renderer, writeBuffer, scene, dt, maskActive);
   }
 }
 
 const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
 const CLOUD_STEPS = 48;
 let groundScale = 1.0;
-let cloudScale = 0.38;
+let cloudScale = 1.0;   // cloud image resolution (K / settings), default 100% (user, 2026-11-13); 0.38 smeared while orbiting
 let outputScale = Math.max(groundScale, cloudScale);
 renderer.setPixelRatio(outputScale);
 renderer.setSize(innerWidth, innerHeight);
@@ -140,7 +264,11 @@ vec3 CustomToneMapping( vec3 v ) {
 }`);
 // The output pass uses three's unused Linear slot for the captured Catalyst transform.
 const CATALYST_OUTPUT = THREE.LinearToneMapping;
-renderer.toneMapping = CATALYST_OUTPUT;
+// Raw output: exposure, then a plain clip to [0, 1] and sRGB encoding. No tone curve, no LUT, no
+// colour scale, no vignette or grain (the default while the colour pipeline is being rebuilt).
+const RAW_OUTPUT = THREE.NoToneMapping;
+const _gradeUp = new THREE.Vector3();
+renderer.toneMapping = CATALYST_OUTPUT;   // default look (user choice 2026-11-13); Y cycles Grade/Raw/...
 renderer.toneMappingExposure = 1.0;   // exposure is set by the camera model (AutoExposurePass)
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -153,6 +281,9 @@ manager.onProgress = (_u, loaded, total) => { $('loadbar').style.width = `${(loa
 // the single source of light (sun, atmosphere, shared cloud shadows) for every pass below
 const lighting = new Lighting(renderer);
 const world = createWorld(renderer, manager, lighting);
+// the terminator effects' switch is the ground's; cloud providers read it through the hub too
+// (same uniform object, so toggling it changes both)
+lighting.uniforms.uTwilight = world.shared.uTwilight;
 const worldCam = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 10, 2.5e5);
 worldCam.layers.enable(1);
 
@@ -168,6 +299,28 @@ Object.assign(sunLight.shadow.camera, { left: -3.4, right: 3.4, top: 3.4, bottom
 sunLight.shadow.bias = -0.0004;
 sunLight.shadow.normalBias = 0.012;
 satScene.add(sunLight, sunLight.target);
+// In eclipse the sun goes out and the probe sees a dark Earth: without these the spacecraft was a
+// black cutout against the moonlit / lamp-lit night side.
+// The moon: same direction, phase and units as the planet's moonlight (uMoonE), so the hull is lit
+// from the same side as the moonlit clouds below. Shadows from a smaller map (it is dim).
+const moonLight = new THREE.DirectionalLight(0xffffff, 0);
+moonLight.castShadow = true;
+moonLight.shadow.mapSize.set(1024, 1024);
+Object.assign(moonLight.shadow.camera, { left: -3.4, right: 3.4, top: 3.4, bottom: -3.4, near: 0.5, far: 30 });
+moonLight.shadow.bias = -0.0006;
+moonLight.shadow.normalBias = 0.02;
+satScene.add(moonLight, moonLight.target);
+// The night sky: starlight + airglow, the same (lifted) uNightGlowE the night side gets, so the hull
+// keeps pace with the land and clouds as the night boost raises them. Cool from above; the Earth
+// below is already in the environment probe, so the ground colour stays near black.
+const skyFill = new THREE.HemisphereLight(0x6b9eff, 0x05070a, 0);
+satScene.add(skyFill);
+const NIGHT_SKY_COLOR = new THREE.Color(0.42, 0.62, 1.15);   // as the planet's night ambient tint
+// ...and its ground side carries the cities below: warm sodium / LED light thrown up onto the hull
+// (citybounce.js; `cityBounce.gain` sets how far it is lifted above the physical share)
+const cityBounce = createCityBounce();
+const CITY_TINT = new THREE.Color(1.48, 0.92, 0.41);         // as the city glow on the clouds
+const MOON_TINT = new THREE.Color(0.72, 0.86, 1.2);          // as the planet's moonlight tint
 
 // environment probe: renders the real planet/atmosphere around the spacecraft for reflections
 const cubeRT = new THREE.WebGLCubeRenderTarget(256, { type: THREE.HalfFloatType });
@@ -242,11 +395,13 @@ const lensPass = new ShaderPass({
     tDiffuse: { value: null }, uTime: { value: 0 }, uDistort: { value: 0 }, uAspect: { value: 1 },
     uVignette: { value: 0.32 }, uGrain: { value: 0.012 },
     uFish: { value: 0 }, uTanV: { value: 1 }, uThetaMax: { value: 1.17 },
+    tGradeLut: { value: buildGradeLut() }, uGrade: { value: 0 }, uBlack: { value: 0 },   // OpenWorld grade (src/grade.js)
   },
   vertexShader: `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`,
   fragmentShader: /* glsl */ `
     uniform sampler2D tDiffuse; uniform float uTime, uDistort, uAspect, uVignette, uGrain;
-    uniform float uFish, uTanV, uThetaMax;
+    uniform float uFish, uTanV, uThetaMax, uGrade;
+    ${gradeLutGLSL}
     varying vec2 vUv;
     float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233)) + uTime) * 43758.5453); }
     void main(){
@@ -266,6 +421,7 @@ const lensPass = new ShaderPass({
       cd.x /= uAspect;
       vec2 uv = cd + 0.5;
       vec3 col = texture2D(tDiffuse, uv).rgb;
+      if (uGrade > 0.5) col = applyBlackLevel(applyGradeLut(max(col, 0.0)));
       col *= 1.0 - uVignette * smoothstep(0.15, 0.95, r2 / (0.25 * (uAspect * uAspect + 1.0)) );
       col += (h(vUv * 917.0) - 0.5) * uGrain * (0.4 + col);
       gl_FragColor = vec4(max(col, 0.0), 1.0);
@@ -301,6 +457,12 @@ if (!aoPass.copyMaterial.fragmentShader.includes('badF(c.r)')) console.warn('NaN
 aoPass.copyMaterial.needsUpdate = true;
 const sceneStage = new SceneStagePass(scenePasses, satPass, aoPass);
 composer.addPass(sceneStage);
+// the stars leave the planet scene for their own pass after the DOF blur (SceneStagePass)
+const starScene = new THREE.Scene();
+world.scene.remove(world.stars);
+starScene.add(world.stars);
+Object.assign(sceneStage, { starScene, starCam: worldCam, starUniforms: world.starUniforms });
+world.starUniforms.uRes.value.set(sceneStage.base.width, sceneStage.base.height);
 composer.addPass(exposurePass);
 composer.addPass(flarePass.visPass); // how much of the sun's disc is lit, measured before bloom
 composer.addPass(bloom);
@@ -377,13 +539,25 @@ composer.addPass(actionPass);   // action-camera image processing, in display sp
 // Simulation & cameras
 // ---------------------------------------------------------------------------------------------
 let starI = 0;
+let STAR_DAY = 0.35;   // daylight star field, as a fraction of its night look (live: __sx.setStarDay)
+const STAR_DAY_GAMMA = 0.5;
+let starGamma = 1;
 const sim = new Sim();
 sim.setLocation(PLACES[0].lat, PLACES[0].lon);
 // the sun stands where it really is right now; the clock then runs in real time (x warp)
 sim.setRealTime();
+// SPHEREx's real path (TLE + SGP4): start where the spacecraft really is right now, on the bundled
+// elements, then swap in the server's fresh ones when they arrive
+sim.orbit = new RealOrbit();
+sim.followRealOrbit();
+sim.pointing = new SurveyPointing(sim.orbit);
+loadSpherexTle().then(({ lines, live }) => {
+  if (!live) return;
+  try { sim.orbit.setTle(lines); if (sim.onOrbit) sim.syncOrbit(); } catch (e) { console.warn('SPHEREx TLE', e); }
+});
 
-const CAM_MODES = ['CHASE', ...HULL_CAMS.map((c) => c.name), 'FREE FLIGHT'];
-let camMode = 1;
+const CAM_MODES = ['CHASE', ...HULL_CAMS.map((c) => c.name), 'HERO', 'FREE FLIGHT'];
+let camMode = HERO_MODE;   // start in the HERO camera
 const orbitCam = { yaw: 2.35, pitch: 0.22, dist: 9.5 };
 const hullLook = { yaw: 0, pitch: 0, fovMul: 1 };
 const free = { pos: new THREE.Vector3(), yaw: 0, pitch: -0.3, speed: 2.0 };
@@ -393,7 +567,7 @@ const keys = new Set();
 addEventListener('keydown', (e) => {
   if (e.repeat && !['KeyW', 'KeyS', 'KeyA', 'KeyD'].includes(e.code)) { keys.add(e.code); return; }
   keys.add(e.code);
-  const place = PLACES.find((p) => `Digit${p.key}` === e.code);
+  const place = PLACES.find((p) => `Digit${p.key}` === e.code && !!p.shift === e.shiftKey);
   if (place) teleport(place);
   switch (e.code) {
     case 'KeyC': case 'KeyV': setCamMode((camMode + (e.shiftKey ? CAM_MODES.length - 1 : 1)) % CAM_MODES.length); break;
@@ -422,15 +596,26 @@ addEventListener('keydown', (e) => {
     case 'Minus': if (!CLOUDS_ENABLED) break; cloudCover = Math.max(0, cloudCover - 0.1); toast(`Cloud cover ${(cloudCover * 100).toFixed(0)}%`); break;
     case 'Equal': if (!CLOUDS_ENABLED) break; cloudCover = Math.min(1.6, cloudCover + 0.1); toast(`Cloud cover ${(cloudCover * 100).toFixed(0)}%`); break;
     case 'KeyY': {
-      const tms = [[CATALYST_OUTPUT, 'Catalyst (city4 capture)'], [THREE.CustomToneMapping, 'AgX punchy (Groundview)'], [THREE.AgXToneMapping, 'AgX'], [THREE.ACESFilmicToneMapping, 'ACES filmic'], [THREE.NeutralToneMapping, 'Khronos neutral']];
-      const i = (tms.findIndex((t) => t[0] === renderer.toneMapping) + 1) % tms.length;
-      renderer.toneMapping = tms[i][0]; toast(`Tonemapper · ${tms[i][1]}`); break;
+      // [three tone mapping, OpenWorld grade LUT in the lens pass, name]
+      const tms = [[CATALYST_OUTPUT, false, 'Catalyst (city4 capture)'], [RAW_OUTPUT, true, 'OpenWorld grade (LUT)'],
+        [RAW_OUTPUT, false, 'Raw (no curve, LUT or grade)'], [THREE.CustomToneMapping, false, 'AgX punchy (Groundview)'],
+        [THREE.AgXToneMapping, false, 'AgX'], [THREE.ACESFilmicToneMapping, false, 'ACES filmic'], [THREE.NeutralToneMapping, false, 'Khronos neutral']];
+      const g = lensPass.uniforms.uGrade.value > 0.5;
+      const i = (tms.findIndex((t) => t[0] === renderer.toneMapping && t[1] === g) + 1) % tms.length;
+      renderer.toneMapping = tms[i][0]; lensPass.uniforms.uGrade.value = tms[i][1] ? 1 : 0;
+      toast(`Tonemapper · ${tms[i][2]}`); break;
+    }
+    case 'Backslash': {
+      const i = (Math.max(0, DOF_APERTURES.indexOf(dof.aperture)) + 1) % DOF_APERTURES.length;
+      dof.aperture = DOF_APERTURES[i];
+      toast(`Depth of field · ${DOF_NAMES[i]}`);
+      break;
     }
     case 'KeyU': exposurePass.auto = !exposurePass.auto; exposurePass.reset = true; toast(`Auto exposure ${exposurePass.auto ? 'ON' : 'OFF'}`); break;
     case 'KeyJ': flarePass.enabled = !flarePass.enabled; toast(`Lens flare ${flarePass.enabled ? 'ON' : 'OFF'}`); break;
     case 'Semicolon': exposurePass.compEV = Math.max(-3, exposurePass.compEV - 0.5); toast(`Exposure ${exposurePass.compEV >= 0 ? '+' : ''}${exposurePass.compEV.toFixed(1)} EV`); break;
     case 'Quote': exposurePass.compEV = Math.min(3, exposurePass.compEV + 0.5); toast(`Exposure ${exposurePass.compEV >= 0 ? '+' : ''}${exposurePass.compEV.toFixed(1)} EV`); break;
-    case 'KeyN': sim.setRealTime(); toast(`Clock synced to now · ${sim.date.toUTCString().slice(5, 22)} UTC`); break;
+    case 'KeyN': sim.sunShiftH = 0; sim.setRealTime(); if (sim.onOrbit) sim.syncOrbit(); toast(`Clock synced to now · ${sim.date.toUTCString().slice(5, 22)} UTC`); break;
     case 'KeyZ': {
       // only the Blender cloud models (with PROCEDURAL_CLOUDS off, switching them off clears the sky)
       const s = world.shared;
@@ -440,7 +625,11 @@ addEventListener('keydown', (e) => {
       toast(`Blender clouds ${s.uModelsOn.value ? 'ON' : 'OFF'}`);
       break;
     }
-    case 'KeyO': sim.speedMul = 1; toast('Orbital velocity restored'); break;
+    case 'KeyI': setCamMode(HERO_MODE); break;
+    case 'KeyO':
+      if (sim.followRealOrbit()) { toast(`On SPHEREx's real path · TLE epoch ${sim.orbit.epoch.toISOString().slice(0, 16).replace('T', ' ')} UTC`); if (planOpen) replan(); }
+      else { sim.speedMul = 1; toast('Orbital velocity restored'); }
+      break;
     case 'KeyL': setPlanOpen(!planOpen); break;
     case 'Escape': if (planOpen) setPlanOpen(false); break;
   }
@@ -451,7 +640,8 @@ addEventListener('blur', () => keys.clear());
 const snapWarp = (w) => [1, 2, 5, 10, 50, 250, 1000].reduce((a, b) => (Math.abs(b - w) < Math.abs(a - w) ? b : a));
 
 let dragging = false, lastX = 0, lastY = 0;
-renderer.domElement.addEventListener('pointerdown', (e) => { dragging = true; lastX = e.clientX; lastY = e.clientY; renderer.domElement.setPointerCapture(e.pointerId); });
+renderer.domElement.addEventListener('pointerdown', (e) => { if (camMode === HERO_MODE) return;   // the HERO camera is fixed
+  dragging = true; lastX = e.clientX; lastY = e.clientY; renderer.domElement.setPointerCapture(e.pointerId); });
 renderer.domElement.addEventListener('pointerup', () => { dragging = false; });
 renderer.domElement.addEventListener('pointermove', (e) => {
   if (!dragging) return;
@@ -462,11 +652,12 @@ renderer.domElement.addEventListener('pointermove', (e) => {
   else { hullLook.yaw -= dx * 1.6; hullLook.pitch = THREE.MathUtils.clamp(hullLook.pitch - dy * 1.6, -1.2, 1.2); }
 });
 renderer.domElement.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  if (camMode === HERO_MODE) return;   // fixed: no zoom
   const k = Math.exp(e.deltaY * 0.0012);
   if (camMode === 0) orbitCam.dist = THREE.MathUtils.clamp(orbitCam.dist * k, 4.2, 400);
   else if (camMode === CAM_MODES.length - 1) free.speed = THREE.MathUtils.clamp(free.speed / k, 0.005, 2000);
   else hullLook.fovMul = THREE.MathUtils.clamp(hullLook.fovMul * k, 0.25, 1.25);
-  e.preventDefault();
 }, { passive: false });
 
 function setCamMode(m) {
@@ -484,7 +675,7 @@ function setCamMode(m) {
   toast(`Camera · ${CAM_MODES[m]}`);
 }
 
-const resolutionSteps = { ground: [50, 75, 100], cloud: [25, 38, 50, 75, 100] };
+const resolutionSteps = { ground: [50, 75, 100], cloud: [25, 38, 50, 60, 75, 100] };
 let resolutionTimer = 0;
 
 function setRangeFill(input) {
@@ -505,6 +696,7 @@ function applyResolutionScales(announce = '') {
   outputScale = Math.max(groundScale, cloudScale);
   worldPass.setScale(groundScale / outputScale);
   cloudPass.setQuality(cloudScale / outputScale, CLOUD_STEPS);
+  if (!cloudSlot.provider?.ownScale) cloudSlot.setScale(cloudScale / outputScale);
   renderer.setPixelRatio(outputScale);
   composer.setPixelRatio(outputScale);
   onResize();
@@ -541,9 +733,9 @@ for (const kind of ['ground', 'cloud']) {
 applyResolutionScales();
 
 function teleport(place) {
-  sim.setLocation(place.lat, place.lon);
+  sim.setLocation(place.lat, place.lon, sim.orbitHeading(place.lat, !place.south));
   sim.speedMul = 1;
-  if (camMode === CAM_MODES.length - 1) setCamMode(1);
+  if (camMode === CAM_MODES.length - 1) setCamMode(HERO_MODE);
   toast(place.name, true);
   if (planOpen) replan();
 }
@@ -664,6 +856,7 @@ function readInput(dt) {
 }
 
 function updateCamera() {
+  hullLook.aspect = satCam.aspect;
   const satPos = sim.posKm;
   const up = sim.p;
   if (camMode === CAM_MODES.length - 1) {
@@ -717,20 +910,64 @@ function frame(now) {
   tick(dt, now);
 }
 
+// Depth of field (SceneStagePass): a lens focused on the spacecraft. The background is at infinity,
+// so its blur disc is A / s radians (aperture diameter A, focus distance s), turned into pixels by
+// the camera's field of view. Hull cameras sit on the spacecraft (s ~ 1 m): no DOF there.
+// \ cycles the aperture. Live: __sx.dof.aperture (metres).
+const DOF_APERTURES = [0, 0.05, 0.12, 0.25];
+const DOF_NAMES = ['OFF', 'subtle', 'cinematic', 'strong'];
+const dof = { aperture: 0.12, maxRadius: 48, nearFrac: 0.12 };
+function updateDof() {
+  const hull = camMode >= 1 && camMode <= HULL_CAMS.length;
+  const sDist = satCam.position.length();   // camera to the spacecraft (metres)
+  if (hull || dof.aperture <= 0 || sDist < 0.5) { sceneStage.dofRadius = 0; return; }
+  const tanV = Math.tan(THREE.MathUtils.degToRad(satCam.fov) / 2);
+  const pxPerRad = sceneStage.base.height / (2 * tanV);
+  const rMax = Math.min(dof.maxRadius, 0.5 * (dof.aperture / sDist) * pxPerRad);
+  sceneStage.dofRadius = rMax;
+  // progressive: the ground straight below (camera altitude) gets dof.nearFrac of the far blur,
+  // rising to the full blur at the horizon distance and in the sky
+  const camR = worldCam.position.length(), alt = Math.max(camR - R_EARTH, 1);
+  const U = sceneStage.dofU;
+  U.uNear.value = worldCam.near; U.uFar.value = worldCam.far;
+  U.uTanV.value = tanV; U.uAspect.value = worldCam.aspect;
+  U.uDNear.value = alt;
+  U.uDFar.value = Math.sqrt(camR * camR - R_EARTH * R_EARTH);
+  U.uRMin.value = rMax * dof.nearFrac;
+  U.uRMax.value = rMax;
+}
+
 function tick(dt, now = performance.now()) {
   fpsAcc += dt; fpsN++;
   if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
 
   const input = readInput(dt);
+  const wasOnOrbit = sim.onOrbit;
   sim.update(dt, input);
+  if (wasOnOrbit && !sim.onOrbit) toast(`Left SPHEREx's real path (${sim.offOrbitReason}) · O to return`);
   spherex.quaternion.copy(sim.att);
   updateCamera();
+  updateDof();
 
   lighting.update(sim);
+  // night ambient held at its full-night look when daylight in frame lowers the exposure
+  exposurePass.pollEV(renderer);
+  worldCam.updateMatrixWorld();
+  lighting.updateNightBoost(exposurePass.ev, exposurePass.maxEV, lighting.nightShareOf(worldCam), dt);
   const sunDir = lighting.sunDir;
   // Stars are ~1e-6 of the sunlit Earth's brightness: a camera exposed for daylight (the
   // spacecraft or the day side in frame) records black space. They only come out in eclipse.
   starI = 0.35 * (1 - THREE.MathUtils.smoothstep(sunColor.g, 0.0, 0.05));
+  // ...but a subtle field is kept in daylight (artistic, user 2026-11-14): at least STAR_DAY of
+  // their night-time on-screen brightness, whatever the exposure. Night exposure scale is
+  // base * curveGain * 2^maxEV; dividing by the current scale cancels the camera's exposure.
+  {
+    const scale = (ev) => exposurePass.base * exposurePass.curveGain * 2 ** ev;
+    const dayI = STAR_DAY * 0.35 * scale(exposurePass.maxEV) / scale(exposurePass.ev + exposurePass.compEV + exposurePass.biasEV);
+    // the daylight field: faint stars lifted (gamma) so it reads as a fine scatter, not a few points
+    starGamma = dayI > starI ? STAR_DAY_GAMMA : 1;
+    starI = Math.max(starI, dayI);
+  }
   // sunlight on the spacecraft: eclipse + limb reddening (sunColor, also drives the HUD and the
   // stars), times the shadow of a plugged-in cloud provider's clouds (probed a frame late)
   lighting.sunColorAt(sim.posKm, sunColor);
@@ -741,6 +978,35 @@ function tick(dt, now = performance.now()) {
   cloudSlot.dt = dt;
   sunLight.position.copy(sunDir).multiplyScalar(12);
   sunLight.target.position.set(0, 0, 0);
+  // night lights on the hull fade in as the sun leaves it (physically the moon is ~2e-6 of the sun:
+  // only the eclipse exposure ever shows it)
+  const sunLum = sunColor.r * 0.2126 + sunColor.g * 0.7152 + sunColor.b * 0.0722;
+  // The ramp spans the whole orbital sunset (sun 50 % -> 5 %, ~10 s), not just its last 8 %: the
+  // shadow side used to go black while the sun reddened, then the blue fill snapped on within 2 s.
+  // Against the remaining sunlight the fill is invisible on the lit side; it only catches the
+  // shadow side, so day turns to night as a cross-fade (orange rim + navy shade, then navy).
+  const nightF = 1 - THREE.MathUtils.smoothstep(sunLum * lighting.probeT, 0.05, 0.5);
+  lighting.moonColorAt(sim.posKm, moonLight.color);
+  moonLight.color.multiply(MOON_TINT);
+  moonLight.intensity = nightF;   // (kept visible and shadowed at 0: toggling recompiles every material)
+  moonLight.position.copy(lighting.uniforms.uMoonDir.value).multiplyScalar(12);
+  moonLight.target.position.set(0, 0, 0);
+  skyFill.position.copy(sim.posKm).normalize();
+  // hemisphere light: sky colour = night-sky irradiance from above, ground colour = city light from
+  // below (each is the irradiance on a surface facing straight up / down)
+  // The fill follows the night side's lift, so it is keyed to how dark the Earth below is too, not
+  // only to the sun on the hull: late in the day the spacecraft is still sunlit but the ground under
+  // it is already night (shown navy by the night boost), and its anti-sun side -- facing that night
+  // ground and space, no earthshine -- was pure black above a visibly lit night side.
+  const belowDark = 1 - THREE.MathUtils.smoothstep(_gradeUp.copy(sim.posKm).normalize().dot(sunDir), -0.3, 0.3);
+  const fillF = Math.max(nightF, belowDark);
+  skyFill.color.copy(NIGHT_SKY_COLOR).multiplyScalar(lighting.uniforms.uNightGlowE.value);
+  const cityE = fillF > 0.001 ? cityBounce.update(sim.posKm, sunDir) * world.shared.uLights.value * cityBounce.gain : 0;
+  skyFill.groundColor.copy(CITY_TINT).multiplyScalar(cityE);
+  // ...and lifted further (up to 4x) while the hull itself is still sunlit: the frame is then exposed
+  // for sunlight and the limb glare, and the bare night-side level left the shade side black. In
+  // eclipse (nightF 1) the lift is gone and the night look is as tuned.
+  skyFill.intensity = fillF * (1 + 3 * (1 - nightF) * belowDark);
 
   // clouds are static: uWind / uCloudTime stay at 0 (no drift, no evolution as time passes)
   // the procedural shapes are disabled: without the Blender models there is no cloud (nor its shadows)
@@ -761,6 +1027,7 @@ function tick(dt, now = performance.now()) {
     renderer.render(world.scene, cubeCam.children[cubeFace]);
     renderer.setRenderTarget(prevRT);
     world.starUniforms.uStarI.value = starI;
+    world.starUniforms.uStarGamma.value = starGamma;
     cubeFace = (cubeFace + 1) % 6;
     if (cubeFace === 0 || frameNo < 6) cubeRT.texture.needsPMREMUpdate = true;
   }
@@ -771,11 +1038,19 @@ function tick(dt, now = performance.now()) {
   // other curves get that gain here so the frame keeps its
   // brightness -- and a grey card lands near Groundview's in flight views
   exposurePass.curveGain = renderer.toneMapping === THREE.ACESFilmicToneMapping ? 1 : 1 / 0.6;
+  // the spacecraft layer's MSAA weighting follows the exposure (CPU copy, a few frames late).
+  // 4x the exposure scale measured best (isolated bright dots on a backlit hull ~90 -> ~35);
+  // capped at 6 because the half-float layer loses precision near 1 (K = 16 was worse again)
+  const expScale = exposurePass.base * exposurePass.curveGain * 2 ** (exposurePass.ev + exposurePass.compEV + exposurePass.biasEV);
+  hdrResolve.uHdrK.value = THREE.MathUtils.clamp(4 * expScale, 1, 6);
   setBloomProfile(catalyst);
   // Catalyst's two lens-reflection planes (pink and blue rings mirrored from the bloom), with the sun flare
   lensReflectionPass.enabled = catalyst && flarePass.enabled;
   if (catalyst) lensPass.uniforms.uVignette.value = 0; // applied by the captured output transform
-  flarePass.update(worldCam, sunDir, renderer.domElement.width, renderer.domElement.height);
+  if (renderer.toneMapping === RAW_OUTPUT) { lensPass.uniforms.uVignette.value = 0; lensPass.uniforms.uGrain.value = 0; }
+  // grade black level: full over the day side, none on the night side (faint lights and airglow)
+  _gradeUp.copy(sim.posKm).normalize();
+  lensPass.uniforms.uBlack.value = GRADE.black * THREE.MathUtils.smoothstep(sunDir.dot(_gradeUp), -0.2, 0.15);  flarePass.update(worldCam, sunDir, renderer.domElement.width, renderer.domElement.height);
   actionPass.update(now, innerWidth, innerHeight, hullLook.fovMul);
   if ((frameNo & 1) === 0) renderer.shadowMap.needsUpdate = true;
   composer.render(dt);
@@ -797,14 +1072,15 @@ function updateHud() {
   $('t-lat').textContent = fmtLat(sim.lat, 'N', 'S');
   $('t-lon').textContent = fmtLat(sim.lon, 'E', 'W');
   $('t-hdg').textContent = `${sim.heading.toFixed(1)}°`;
-  $('t-lst').textContent = fmtTime(sim.localSolarTime);
+  $('t-lst').textContent = fmtTime(sim.localSolarTime) + (Math.abs(sim.sunShiftH) > 0.01 ? ` · SUN ${sim.sunShiftH > 0 ? '+' : '−'}${Math.abs(sim.sunShiftH).toFixed(1)} h` : '');
   $('t-utc').textContent = `${sim.date.toUTCString().slice(5, 11).toUpperCase()} ${fmtTime(sim.utc)} UTC`;
   $('t-sun').textContent = lit ? (sunColor.b < 0.6 ? 'TERMINATOR' : 'SUNLIT') : 'ECLIPSE';
   $('t-sun').className = lit ? '' : 'warn';
   $('t-warp').textContent = sim.paused ? 'PAUSED' : `×${sim.warp}`;
-  $('t-period').textContent = `${(2 * Math.PI * (R_EARTH + sim.alt) / sim.orbitalSpeed / 60).toFixed(1)} min`;
+  $('t-period').textContent = `${sim.periodMin.toFixed(1)} min`;
+  $('t-path').textContent = sim.onOrbit ? 'REAL (SGP4)' : 'MANUAL';
   $('cam-mode').textContent = CAM_MODES[camMode];
-  $('att-mode').textContent = sim.attModes[sim.attMode];
+  $('att-mode').textContent = sim.attMode === 3 ? `SURVEY · ${sim.pointing.source === 'IRSA' ? 'IRSA (REAL)' : 'MODEL'}` : sim.attModes[sim.attMode];
   $('fps').textContent = `${fps.toFixed(0)} FPS · G ${Math.round(groundScale * 100)}% · C ${Math.round(cloudScale * 100)}%`;
   const p = world.tiles.pending;
   $('tiles').textContent = p > 0 ? `STREAMING IMAGERY · ${p}` : 'IMAGERY LOCKED';
@@ -825,29 +1101,45 @@ addEventListener('resize', onResize);
 onResize();
 
 // places list in the help panel
-$('places').innerHTML = PLACES.map((p) => `<li><kbd>${p.key}</kbd>${p.name}</li>`).join('');
+$('places').innerHTML = PLACES.map((p) => `<li><kbd>${p.shift ? '⇧' : ''}${p.key}</kbd>${p.name}</li>`).join('');
 
+// on the real path the start is wherever SPHEREx really is, not the first preset place
+const welcomeToast = () => toast(sim.onOrbit ? `SPHEREx · ${sim.date.toUTCString().slice(5, 22)} UTC` : PLACES[0].name, true);
 manager.onLoad = () => {
   $('loader').classList.add('done');
-  setTimeout(() => toast(PLACES[0].name, true), 600);
+  if (!heroOpen) setTimeout(welcomeToast, 600);
 };
+
+// Landing hero over the live render (body.hero). Entering hands over to the HUD.
+let heroOpen = document.body.classList.contains('hero');
+function enterFlight() {
+  if (!heroOpen) return;
+  heroOpen = false;
+  document.body.classList.remove('hero');
+  setTimeout(welcomeToast, 500);
+}
+$('hero-explore').addEventListener('click', enterFlight);
+$('hero-start').addEventListener('click', enterFlight);
+$('hero-about').addEventListener('click', () => { enterFlight(); showHelp = true; $('help').classList.add('open'); });
+addEventListener('keydown', (e) => { if (heroOpen && (e.code === 'Enter' || e.code === 'Escape')) enterFlight(); });
 // External cloud renderer (see cloudslot.js for the contract): setCloudProvider(provider) attaches
 // one, setCloudProvider(null) detaches it. A provider with a lat/lon `box` owns that region: the
 // built-in clouds are cut out of it.
 function setCloudProvider(p) {
   cloudSlot.setProvider(p);
+  if (p && !p.ownScale) cloudSlot.setScale(cloudScale / outputScale);   // the resolution setting, not the provider's default
   const b = cloudSlot.provider?.box, d = Math.PI / 180;
   world.shared.uCloudCutOn.value = b ? 1 : 0;
   if (b) world.shared.uCloudCut.value.set(b.lon0 * d, b.lat0 * d, b.lon1 * d, b.lat1 * d);
 }
-// No clouds by default. On request: ?clouds=cloudworks (CloudWorks clouds over the planet, from the
-// observed day), ?clouds=cloudworks-lineup (the ten genera in a row), ?clouds=greece (raymarched region clouds over the Ionian Sea / Greece),
+// Clouds by default: the photo clouds (photoclouds.js), the observed day's VIIRS imagery at ~1.2 km,
+// relit by the sun, the moon and the cities below (?clouds=none turns them off). Also: ?clouds=greece
+// (raymarched region clouds over the Ionian Sea / Greece),
 // ?clouds=example (the template provider).
-const CLOUD_TEST = new URLSearchParams(location.search).get('clouds') || 'none';
-if (CLOUD_TEST === 'greece') setCloudProvider(createRegionCloudProvider());
+const CLOUD_TEST = new URLSearchParams(location.search).get('clouds') || 'photo';
+if (CLOUD_TEST === 'photo') setCloudProvider(createPhotoCloudProvider({ lightsGain: () => world.shared.uLights.value }));
+else if (CLOUD_TEST === 'greece') setCloudProvider(createRegionCloudProvider());
 else if (CLOUD_TEST === 'example') setCloudProvider(createExampleCloudProvider());
-else if (CLOUD_TEST === 'cloudworks') setCloudProvider(createCloudWorksProvider());
-else if (CLOUD_TEST === 'cloudworks-lineup') setCloudProvider(createCloudWorksProvider({ mode: 'lineup' }));
 
 // shader warm-up so the first visible frame doesn't hitch
 renderer.compile(world.scene, worldCam);
@@ -855,7 +1147,12 @@ renderer.compile(satScene, satCam);
 requestAnimationFrame(frame);
 
 // debug handle
-window.__sx = { cameraPose, viewFromPose, makePose, makeView, lighting, cloudSlot, setCloudProvider, createExampleCloudProvider, createRegionCloudProvider, createCloudWorksProvider, planner, setPlanOpen, aoPass, step: (n = 1, dt = 1 / 60) => { for (let i = 0; i < n; i++) tick(dt); }, sim, world, renderer, worldCam, satCam, setCamMode, orbitCam, hullLook, free, bloom, composer, lensPass, spherex, sunLight, cloudPass, exposurePass, flarePass, actionPass };
+window.__sx = { dof, setStarDay: (v) => { STAR_DAY = v; }, HERO, HERO_MODE, cameraPose, viewFromPose, makePose, makeView, lighting, cloudSlot, setCloudProvider, createExampleCloudProvider, createRegionCloudProvider,createPhotoCloudProvider, planner, setPlanOpen, aoPass, step: (n = 1, dt = 1 / 60) => { for (let i = 0; i < n; i++) tick(dt); }, sim, world, renderer, worldCam, satCam, setCamMode, orbitCam, hullLook, free, bloom, composer, lensPass, spherex, sunLight, cityBounce, cubeRT, cubeCam, satScene, cloudPass, exposurePass, flarePass, actionPass };
+// live grade tuning: edit __sx.grade.params, then __sx.grade.rebuild()
+window.__sx.grade = {
+  params: GRADE,
+  rebuild() { const u = lensPass.uniforms.tGradeLut; const old = u.value; u.value = buildGradeLut(); old.dispose(); },
+};
 // test helper: step frames (works even while the tab is in the background) until imagery settles
 window.__sx.settle = async (ms = 15000) => {
   const t0 = performance.now();
