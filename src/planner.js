@@ -31,7 +31,8 @@ export class FlightPlanner {
     const s = new Sim();
     s.p.copy(sim.p); s.f.copy(sim.f); s.alt = sim.alt; s.speedMul = sim.speedMul || 1;
     s.utc = sim.utc; s.doy = sim.doy; s.year = sim.year; s.warp = 1; s.paused = false;
-    const period = 2 * Math.PI * (R_EARTH + s.alt) / s.groundSpeed;
+    s.orbit = sim.orbit; if (sim.onOrbit) s.followRealOrbit();
+    const period = s.onOrbit ? s.periodMin * 60 : 2 * Math.PI * (R_EARTH + s.alt) / s.groundSpeed;
     const steps = Math.ceil(orbits * period / SAMPLE_S);
     const pxScale = viewportH / (2 * Math.tan(THREE.MathUtils.degToRad(minFov) / 2));
     // all: imagery and terrain in track order, so the download runs ahead of the spacecraft

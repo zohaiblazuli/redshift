@@ -84,8 +84,82 @@ async function serveTile(res, src, z, x, y) {
   }
 }
 
+// SPHEREx's current two-line elements (NORAD 63182) from CelesTrak, cached on disk and refreshed
+// every 6 hours; a stale copy is served when CelesTrak cannot be reached.
+const TLE_FILE = path.join(cacheDir, 'spherex.tle');
+let tleFetch = null;
+function serveTle(res) {
+  const send = (txt) => { res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-cache' }); res.end(txt); };
+  fs.stat(TLE_FILE, (err, st) => {
+    if (!err && Date.now() - st.mtimeMs < 6 * 3600e3) return fs.readFile(TLE_FILE, 'utf8', (e, t) => (e ? (res.writeHead(500), res.end()) : send(t)));
+    tleFetch ||= fetch('https://celestrak.org/NORAD/elements/gp.php?CATNR=63182&FORMAT=TLE', { headers: { 'User-Agent': 'SPHEREx-OpenWorld/1.0' } })
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.status))))
+      .then((t) => {
+        if (!/^1 63182/m.test(t)) throw new Error('no TLE');
+        fs.mkdirSync(cacheDir, { recursive: true }); fs.writeFileSync(TLE_FILE, t); return t;
+      })
+      .finally(() => { tleFetch = null; });
+    tleFetch.then(send, () => fs.readFile(TLE_FILE, 'utf8', (e, t) => (e ? (res.writeHead(502), res.end()) : send(t))));
+  });
+}
+
+// SPHEREx's measured pointing, from the IRSA archive's spectral-image metadata (ObsCore, all Quick
+// Release collections). One exposure = six detector images; their centres are averaged to the
+// boresight. The archive trails real time by weeks, so /spherex/coverage says how far it reaches.
+// Both answers are cached on disk (IRSA's TAP service takes ~20 s per query).
+const POINT_DIR = path.join(cacheDir, 'pointing');
+const irsaPending = new Map();
+function irsaTap(query) {
+  const url = 'https://irsa.ipac.caltech.edu/TAP/sync?FORMAT=csv&QUERY=' + encodeURIComponent(query);
+  return fetch(url, { headers: { 'User-Agent': 'SPHEREx-OpenWorld/1.0' } })
+    .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`IRSA ${r.status}`))));
+}
+function cachedJson(file, maxAgeMs, make, res) {
+  const send = (txt) => { res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' }); res.end(txt); };
+  fs.stat(file, (err, st) => {
+    if (!err && Date.now() - st.mtimeMs < maxAgeMs) return fs.readFile(file, 'utf8', (e, t) => (e ? (res.writeHead(500), res.end()) : send(t)));
+    if (!irsaPending.has(file)) {
+      irsaPending.set(file, make().then((obj) => {
+        const t = JSON.stringify(obj);
+        fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, t); return t;
+      }).finally(() => irsaPending.delete(file)));
+    }
+    irsaPending.get(file).then(send, (e) => fs.readFile(file, 'utf8', (e2, t) => (e2 ? (res.writeHead(502), res.end(String(e.message))) : send(t))));
+  });
+}
+function serveCoverage(res) {
+  cachedJson(path.join(POINT_DIR, 'coverage.json'), 12 * 3600e3, () =>
+    irsaTap("SELECT TOP 1 t_max FROM ivoa.obscore WHERE obs_collection LIKE 'spherex_qr%' AND t_max IS NOT NULL ORDER BY t_max DESC")
+      .then((csv) => ({ lastMjd: Number(csv.trim().split(/\r?\n/)[1]) || null, checked: new Date().toISOString() })), res);
+}
+function servePointingDay(res, day) {
+  const mjd0 = Date.UTC(+day.slice(0, 4), +day.slice(5, 7) - 1, +day.slice(8, 10)) / 864e5 + 40587;
+  cachedJson(path.join(POINT_DIR, day + '.json'), 30 * 864e5, () =>
+    irsaTap(`SELECT obs_id, t_min, t_max, s_ra, s_dec FROM ivoa.obscore WHERE obs_collection LIKE 'spherex_qr%' AND t_min >= ${mjd0} AND t_min < ${mjd0 + 1} AND s_ra IS NOT NULL`)
+      .then((csv) => {
+        const exp = new Map();
+        for (const line of csv.trim().split(/\r?\n/).slice(1)) {
+          const [id, t0, t1, ra, dec] = line.split(',');
+          const a = ra * Math.PI / 180, d = dec * Math.PI / 180;
+          let e = exp.get(id);
+          if (!e) exp.set(id, e = { id, t0: +t0, t1: +t1, v: [0, 0, 0] });
+          e.t0 = Math.min(e.t0, +t0); e.t1 = Math.max(e.t1, +t1);
+          e.v[0] += Math.cos(d) * Math.cos(a); e.v[1] += Math.cos(d) * Math.sin(a); e.v[2] += Math.sin(d);
+        }
+        const list = [...exp.values()].map((e) => {
+          const l = Math.hypot(...e.v);
+          return { id: e.id, t0: e.t0, t1: e.t1, v: e.v.map((x) => +(x / l).toFixed(6)) };
+        }).sort((a, b) => a.t0 - b.t0);
+        return { day, exposures: list };
+      }), res);
+}
+
 http.createServer((req, res) => {
   let p = decodeURIComponent(req.url.split('?')[0]);
+  if (p === '/tle/spherex') return serveTle(res);
+  if (p === '/spherex/coverage') return serveCoverage(res);
+  const pd = p.match(/^\/spherex\/pointing\/(\d{4}-\d{2}-\d{2})$/);
+  if (pd) return servePointingDay(res, pd[1]);
   const m = p.match(/^\/tiles\/(s2|dem)\/(\d{1,2})\/(\d{1,7})\/(\d{1,7})$/);
   if (m) {
     const [z, x, y] = [m[2], m[3], m[4]].map(Number);
