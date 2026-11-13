@@ -10,7 +10,42 @@ const cpM = new THREE.Matrix4(), cpV = new THREE.Vector3(), cpV2 = new THREE.Vec
 const cpQ = new THREE.Quaternion(), cpE = new THREE.Euler(0, 0, 0, 'YXZ');
 const CP_ORIGIN = new THREE.Vector3();
 
-// mode: 0 = chase, 1..HULL_CAMS.length = hull cameras. sim needs .p, .f, .att.
+// HERO camera (mode HULL_CAMS.length + 1): a fixed framing only -- the camera faces the Sun's bearing
+// with the limb across the frame and the spacecraft (in its real attitude) at HERO.sat. Rendering
+// is the same as every other camera. Frame coordinates are NDC (-1..1, y up).
+// Tune live via __sx.HERO.
+export const HERO_MODE = HULL_CAMS.length + 1;
+export const HERO = {
+  fov: 38,              // vertical, degrees
+  sunX: -0.06,          // the camera faces the Sun's bearing, turned so the Sun sits here across ...
+  limbY: -0.16,         // ... with the limb (under the Sun) at this height ...
+  roll: -0.38,          // ... rolled so the limb climbs to the right
+  sat: [0.44, 0.2],     // where the spacecraft (aim point) sits in frame
+  dist: 15,             // camera to spacecraft, metres
+  aim: [0, 0.8, 0],     // body-frame aim point (mid photon shield)
+};
+const heroM = new THREE.Matrix4(), heroQ = new THREE.Quaternion(), heroF = new THREE.Vector3(), heroU = new THREE.Vector3(), heroR = new THREE.Vector3();
+
+// camera orientation for the HERO camera (depends only on where the Sun and the horizon are)
+export function heroCamQuat(sim, hullLook, out) {
+  const up = sim.p, aspect = hullLook.aspect || 16 / 9;
+  const tV = Math.tan(THREE.MathUtils.degToRad(HERO.fov) / 2), tH = tV * aspect;   // fixed: no look-around or zoom
+  // the real Sun, not the [ / ]-shifted light: shifting the light must not swing the camera
+  const sun = sim.sunDirReal || sim.sunDir;
+  heroF.copy(sun).addScaledVector(up, -sun.dot(up));
+  if (heroF.lengthSq() < 1e-8) heroF.copy(sim.f);
+  heroF.normalize().applyAxisAngle(up, Math.atan(HERO.sunX * tH));
+  const dip = Math.acos(R_EARTH / (R_EARTH + sim.alt));
+  const el = -dip + Math.atan(-HERO.limbY * tV);
+  heroF.multiplyScalar(Math.cos(el)).addScaledVector(up, Math.sin(el));
+  heroR.crossVectors(heroF, up).normalize();
+  heroU.crossVectors(heroR, heroF);
+  heroM.makeBasis(heroR, heroU, heroF.negate());
+  out.setFromRotationMatrix(heroM);
+  return out.multiply(heroQ.setFromAxisAngle(heroF.set(0, 0, 1), HERO.roll));
+}
+
+// mode: 0 = chase, 1..HULL_CAMS.length = hull cameras, HERO_MODE = hero. sim needs .p, .f, .att, .sunDir.
 // out: { offset: Vector3 (metres, world axes, camera relative to the spacecraft), quat, fov }
 export function cameraPose(mode, sim, orbitCam, hullLook, out) {
   const up = sim.p;
@@ -25,6 +60,14 @@ export function cameraPose(mode, sim, orbitCam, hullLook, out) {
     cpM.lookAt(out.offset, aim, up);
     out.quat.setFromRotationMatrix(cpM);
     out.fov = 50;
+  } else if (mode === HERO_MODE) {
+    // the camera faces the Sun on the limb; it stands where the spacecraft lands at HERO.sat
+    heroCamQuat(sim, hullLook, out.quat);
+    out.fov = HERO.fov;
+    const tV = Math.tan(THREE.MathUtils.degToRad(out.fov) / 2), tH = tV * (hullLook.aspect || 16 / 9);
+    const toSat = cpV.set(HERO.sat[0] * tH, HERO.sat[1] * tV, -1).normalize().applyQuaternion(out.quat);
+    const aim = cpV2.set(...HERO.aim).applyQuaternion(sim.att);
+    out.offset.copy(aim).addScaledVector(toSat, -HERO.dist);
   } else {
     const hc = HULL_CAMS[mode - 1];
     cpV.set(...hc.dir).normalize();

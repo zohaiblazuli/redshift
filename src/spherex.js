@@ -297,6 +297,171 @@ export const HULL_CAMS = [
 // the array normal on +X (sun side), as the simulation and hull cameras expect.
 // Returns the (empty) spacecraft group at once and fills it when the file arrives; the loading
 // manager keeps the loading screen up until then.
+// ---- tonemap-weighted MSAA resolve -------------------------------------------------------------
+// The spacecraft renders into a 4x MSAA HDR layer (main.js SceneStagePass). Backlit, the sunlit
+// rims of fittings, seams and panel edges are ~1000x the shadowed hull: one lit sample of four
+// still blew the resolved pixel out to white, so thin edges sparkled as single flickering dots
+// as they crossed the sample points. Each sample is written compressed, c / (1 + max(c)), so the
+// hardware resolve averages bounded values; SceneStagePass's composite inverts it. The weight is
+// taken after the camera's exposure (uHdrK = exposure scale, set per frame in main.js), so "bright"
+// means bright in the final image: in a dark backlit frame the exposure is high and a rim that
+// only covers part of a pixel must be held down harder.
+export const hdrResolve = { uHdrK: { value: 1 } };
+export function compressHdrOutput(root) {
+  const done = new Set();
+  root.traverse((o) => {
+    if (!o.isMesh) return;
+    for (const mat of [].concat(o.material)) {
+      if (done.has(mat)) continue;
+      done.add(mat);
+      const prev = mat.onBeforeCompile;
+      mat.onBeforeCompile = (sh, r) => {
+        prev?.call(mat, sh, r);
+        sh.uniforms.uHdrK = hdrResolve.uHdrK;
+        sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nuniform float uHdrK;')
+          .replace('#include <dithering_fragment>',
+            '#include <dithering_fragment>\ngl_FragColor.rgb /= 1.0 + uHdrK * max(max(gl_FragColor.r, gl_FragColor.g), gl_FragColor.b);');
+      };
+      const key = mat.customProgramCacheKey?.bind(mat);
+      mat.customProgramCacheKey = () => (key ? key() : '') + '|hdrres';
+      mat.needsUpdate = true;
+    }
+  });
+}
+
+// ---- baked sky visibility (ambient occlusion for the indirect light) ---------------------------
+// The night fill (a hemisphere light: sky above, city glow below) and the environment probe have no
+// shadows, so they lit the bus and fittings tucked under the photon shield as if the sky were open
+// above them. Once at load: depth maps of the spacecraft from 64 directions; each vertex then counts
+// the directions it can see out along (cosine-weighted about its normal) -> aVis, 0..1. The
+// material patch below scales only the indirect light by it; sun and moon keep their shadow maps.
+const VIS_DIRS = 64, VIS_RES = 512;
+function bakeSkyVisibility(renderer, model) {
+  const t0 = performance.now();
+  model.updateMatrixWorld(true);
+  const toRoot = new THREE.Matrix4().copy(model.parent ? model.parent.matrixWorld : new THREE.Matrix4()).invert();
+  const meshes = [];
+  model.traverse((o) => { if (o.isMesh && o.geometry.attributes.position) meshes.push(o); });
+  // positions / normals in the root frame
+  const P = [], Nn = [];
+  const box = new THREE.Box3();
+  const v = new THREE.Vector3(), nm = new THREE.Matrix3();
+  for (const m of meshes) {
+    if (meshes.some((o) => o !== m && o.geometry === m.geometry)) m.geometry = m.geometry.clone();   // own aVis per mesh
+    const g = m.geometry, pa = g.attributes.position;
+    if (!g.attributes.normal) g.computeVertexNormals();
+    const na = g.attributes.normal;
+    const M = new THREE.Matrix4().multiplyMatrices(toRoot, m.matrixWorld);
+    nm.getNormalMatrix(M);
+    const p = new Float32Array(pa.count * 3), n = new Float32Array(pa.count * 3);
+    for (let i = 0; i < pa.count; i++) {
+      v.fromBufferAttribute(pa, i).applyMatrix4(M); p.set([v.x, v.y, v.z], i * 3); box.expandByPoint(v);
+      v.fromBufferAttribute(na, i).applyMatrix3(nm).normalize(); n.set([v.x, v.y, v.z], i * 3);
+    }
+    P.push(p); Nn.push(n);
+  }
+  const ctr = box.getCenter(new THREE.Vector3()), rad = box.getSize(new THREE.Vector3()).length() * 0.5 + 0.05;
+
+  // depth (distance along the view direction from the near plane) from each direction
+  const scene = new THREE.Scene();
+  const depthMat = new THREE.ShaderMaterial({
+    side: THREE.DoubleSide,
+    vertexShader: 'varying float vD; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); vD = -mv.z; gl_Position = projectionMatrix * mv; }',
+    fragmentShader: 'varying float vD; void main(){ gl_FragColor = vec4(vD, 0.0, 0.0, 1.0); }',
+  });
+  scene.overrideMaterial = depthMat;
+  // render the meshes in place: proxies sharing geometry, with root-frame transforms
+  for (const m of meshes) {
+    const px = new THREE.Mesh(m.geometry, depthMat);
+    px.matrixAutoUpdate = false; px.matrix.multiplyMatrices(toRoot, m.matrixWorld);
+    scene.add(px);
+  }
+  const rt = new THREE.WebGLRenderTarget(VIS_RES, VIS_RES, { type: THREE.FloatType, format: THREE.RGBAFormat, depthBuffer: true });
+  const cam = new THREE.OrthographicCamera(-rad, rad, rad, -rad, 0.01, rad * 2 + 0.1);
+  const buf = new Float32Array(VIS_RES * VIS_RES * 4);
+  // both faces: every material is double-sided and some meshes' normals point inward (the outer
+  // shield's second skin), so the face the camera sees can be either side of the normal
+  const mk = () => P.map((p) => new Float32Array(p.length / 3));
+  const vis = mk(), wsum = mk(), visB = mk(), wsumB = mk();
+  const prevRT = renderer.getRenderTarget(), prevClear = renderer.getClearColor(new THREE.Color()), prevAlpha = renderer.getClearAlpha();
+  const prevShadow = renderer.shadowMap.enabled;
+  renderer.shadowMap.enabled = false;
+  renderer.setClearColor(0x000000, 1);
+  // the auto exposure's async readback can leave a PIXEL_PACK_BUFFER bound: readPixels into an
+  // array then fails (all zeros)
+  const gl = renderer.getContext();
+  if (gl.PIXEL_PACK_BUFFER) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+  const d = new THREE.Vector3(), q = new THREE.Vector3();
+  // occluders closer than ~12 cm are ignored: seams, ribs and fittings stand a few cm proud of the
+  // shield skin and striped it with false occlusion; what matters is the shield over the bus
+  const bias = Math.max(rad * 2 / VIS_RES * 2.5, 0.12);
+  for (let k = 0; k < VIS_DIRS; k++) {
+    // Fibonacci sphere: directions the vertex looks out along
+    const y = 1 - (k + 0.5) / VIS_DIRS * 2, r = Math.sqrt(1 - y * y), a = k * Math.PI * (3 - Math.sqrt(5));
+    d.set(Math.cos(a) * r, y, Math.sin(a) * r);
+    cam.position.copy(ctr).addScaledVector(d, rad + 0.05);
+    cam.up.set(Math.abs(d.y) > 0.9 ? 1 : 0, Math.abs(d.y) > 0.9 ? 0 : 1, 0);
+    cam.lookAt(ctr);
+    cam.updateMatrixWorld(); cam.updateProjectionMatrix();
+    renderer.setRenderTarget(rt);
+    renderer.clear();   // R = 0 marks an empty texel (nothing along this direction)
+    renderer.render(scene, cam);
+    renderer.readRenderTargetPixels(rt, 0, 0, VIS_RES, VIS_RES, buf);
+    const vm = cam.matrixWorldInverse.elements;
+    for (let mi = 0; mi < P.length; mi++) {
+      const p = P[mi], n = Nn[mi];
+      for (let i = 0, c = p.length / 3; i < c; i++) {
+        let cosN = n[i * 3] * d.x + n[i * 3 + 1] * d.y + n[i * 3 + 2] * d.z;
+        const back = cosN < 0;
+        const vv = back ? visB[mi] : vis[mi], ww = back ? wsumB[mi] : wsum[mi];
+        cosN = Math.abs(cosN);
+        if (cosN < 1e-4) continue;
+        ww[i] += cosN;
+        q.set(p[i * 3], p[i * 3 + 1], p[i * 3 + 2]);
+        // view space
+        const vx = vm[0] * q.x + vm[4] * q.y + vm[8] * q.z + vm[12];
+        const vy = vm[1] * q.x + vm[5] * q.y + vm[9] * q.z + vm[13];
+        const vz = vm[2] * q.x + vm[6] * q.y + vm[10] * q.z + vm[14];
+        const tx = Math.floor((vx / rad * 0.5 + 0.5) * VIS_RES), ty = Math.floor((vy / rad * 0.5 + 0.5) * VIS_RES);
+        if (tx < 0 || ty < 0 || tx >= VIS_RES || ty >= VIS_RES) { vv[i] += cosN; continue; }
+        const front = buf[(ty * VIS_RES + tx) * 4];
+        if (front === 0 || -vz <= front + bias) vv[i] += cosN;   // nothing in front of it (0: empty texel)
+      }
+    }
+  }
+  renderer.setRenderTarget(prevRT);
+  renderer.setClearColor(prevClear, prevAlpha);
+  renderer.shadowMap.enabled = prevShadow;
+  rt.dispose(); depthMat.dispose();
+  meshes.forEach((m, mi) => {
+    const out = new Float32Array(vis[mi].length), outB = new Float32Array(vis[mi].length);
+    for (let i = 0; i < out.length; i++) {
+      out[i] = wsum[mi][i] > 0 ? vis[mi][i] / wsum[mi][i] : 1;
+      outB[i] = wsumB[mi][i] > 0 ? visB[mi][i] / wsumB[mi][i] : 1;
+    }
+    m.geometry.setAttribute('aVis', new THREE.BufferAttribute(out, 1));
+    m.geometry.setAttribute('aVisB', new THREE.BufferAttribute(outB, 1));
+  });
+  // indirect light (hemisphere fill, environment probe) x aVis
+  const patched = new Set();
+  for (const m of meshes) for (const mat of [].concat(m.material)) {
+    if (patched.has(mat)) continue;
+    patched.add(mat);
+    const prev = mat.onBeforeCompile;
+    mat.onBeforeCompile = (sh, r) => {
+      prev?.call(mat, sh, r);
+      sh.vertexShader = sh.vertexShader.replace('#include <common>', '#include <common>\nattribute float aVis, aVisB;\nvarying float vVis, vVisB;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvVis = aVis; vVisB = aVisB;');
+      sh.fragmentShader = sh.fragmentShader.replace('#include <common>', '#include <common>\nvarying float vVis, vVisB;')
+        .replace('#include <aomap_fragment>', '#include <aomap_fragment>\n{ float sv = gl_FrontFacing ? vVis : vVisB; sv = sv * sv * (3.0 - 2.0 * sv); reflectedLight.indirectDiffuse *= sv; reflectedLight.indirectSpecular *= mix(sv, 1.0, 0.25); }');
+    };
+    const key = mat.customProgramCacheKey?.bind(mat);
+    mat.customProgramCacheKey = () => (key ? key() : '') + '|skyvis';
+    mat.needsUpdate = true;
+  }
+  console.info(`SPHEREx sky visibility baked (${meshes.length} meshes, ${P.reduce((s, p) => s + p.length / 3, 0)} vertices, ${(performance.now() - t0).toFixed(0)} ms)`);
+}
+
 export function loadSphereX(renderer, manager) {
   const root = new THREE.Group();
   root.name = 'SPHEREx';
@@ -321,9 +486,13 @@ export function loadSphereX(renderer, manager) {
       }
     });
     root.add(model);
+    try { bakeSkyVisibility(renderer, model); } catch (e) { console.warn('SPHEREx sky visibility bake failed; indirect light unoccluded.', e); }
+    compressHdrOutput(model);
   }).catch((e) => {
     console.warn('SPHEREx model (models/spherex.glb) could not be loaded; using the procedural model.', e);
-    root.add(buildSphereX(renderer));
+    const fallback = buildSphereX(renderer);
+    compressHdrOutput(fallback);
+    root.add(fallback);
   });
   return root;
 }
