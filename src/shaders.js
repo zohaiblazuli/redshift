@@ -299,16 +299,49 @@ export const cloudShadowGLSL = /* glsl */ `
 uniform sampler2D uCloudShadowMap;
 uniform mat4 uCloudShadowMatrix;   // world (km) -> (u, v, depth km); u, v in [0, 1] cover the map
 uniform float uCloudShadowOn;
+uniform float uCloudShadowAlt;   // 1: alpha holds the front altitude x optical depth (see cloudShadowT)
+
+// optical depth toward the sun at p from one shadow-map lookup at uv
+float cloudShadowOD(vec3 p, vec2 uv, float depth){
+  vec4 b = textureLod(uCloudShadowMap, uv, 0.0);
+  float od = min(b.b, b.g * max(depth - b.r, 0.0));
+  // Providers with uCloudShadowAlt store the altitude where the texel's sun ray enters the cloud
+  // (alpha = altitude km x optical depth, so filtering with empty texels keeps it exact). A texel
+  // lumps sun rays up to a texel apart, which with a low sun is the cloud layer's whole height:
+  // without this, a point whose ray passes high over a low cloud took its shadow, and shadows ran
+  // tens to hundreds of km too far (streaks). A ray below the entry still meets the cloud further
+  // toward the sun, so only a ray above it is cleared.
+  if (uCloudShadowAlt > 0.5 && b.b > 1e-4){
+    vec3 pf = p + uSunDir * max(depth - b.r, 0.0);   // this point's sun ray at the cloud's front depth
+    float dz = max(length(pf) - Rg - b.a / b.b, 0.0);
+    od *= exp(-dz * dz * 2.0);                       // gone ~1 km above the entry
+  }
+  return od;
+}
 
 float cloudShadowT(vec3 p){
   if (uCloudShadowOn < 0.5) return 1.0;
   vec3 s = (uCloudShadowMatrix * vec4(p, 1.0)).xyz;
   vec2 e = min(s.xy, 1.0 - s.xy);
   if (min(e.x, e.y) <= 0.0) return 1.0;
-  vec4 b = textureLod(uCloudShadowMap, s.xy, 0.0);
-  float od = min(b.b, b.g * max(s.z - b.r, 0.0));
-  // fade out over the outer 2 % so the map's edge never draws a line on the ground
-  return exp(-od * smoothstep(0.0, 0.02, min(e.x, e.y)));
+  // Low sun: each map texel's shadow is stretched along the sun ~1/sin(elevation) times (tens to
+  // hundreds of km near the terminator), which drew combs of dark streaks across the land. Real
+  // low-sun shadows are washed out by skylight, so they fade out below ~15 degrees, gone by ~2.
+  float muS = dot(p, uSunDir) / length(p);
+  float k = smoothstep(0.03, 0.26, muS) * smoothstep(0.0, 0.02, min(e.x, e.y));   // and the map's edge
+  if (k <= 0.0) return 1.0;
+  // Soft edges: the transmittance averaged over a disc ~1.6 texels across (a cloud edge's shadow
+  // fades over ~5 km instead of following the texels' bilinear contour, which drew hard,
+  // staircase-shaped shadow edges)
+  vec2 tx = 1.6 / vec2(textureSize(uCloudShadowMap, 0));
+  float T = exp(-cloudShadowOD(p, s.xy, s.z) * k) * 0.2;
+  // inner ring: 4 taps at half radius on the diagonals; outer ring: 4 on the axes
+  for (int i = 0; i < 8; i++){
+    float a = float(i) * 1.570796 + (i < 4 ? 0.785398 : 0.0);
+    vec2 o = vec2(cos(a), sin(a)) * (i < 4 ? 0.5 : 1.0);
+    T += exp(-cloudShadowOD(p, s.xy + o * tx, s.z) * k) * 0.1;
+  }
+  return T;
 }
 #endif
 `;
@@ -325,8 +358,15 @@ ${cloudShadowGLSL}
 
 // Legacy 2D cloud deck — only used for the spacecraft's environment probe (cheap).
 export const cloudGLSL = /* glsl */ `
+// uDeckCover, not uCloudCover: with the photo clouds (a post pass the probe cannot see) the
+// procedural clouds are off (uCloudCover 0), but the probe still needs the real cloud deck: it
+// is most of the sunlit Earth's brightness, i.e. most of the earthshine on the spacecraft.
+uniform float uDeckCover;
+uniform sampler2D uDeckCov;      // photo-cloud cover (properties.png R, ~20 km) when the legacy clouds are off
+uniform float uDeckOn;
 float cloudCoverage(vec3 n){
-  return clamp(cloudFraction(n, 2.0) * uCloudCover, 0.0, 1.0);
+  if (uDeckOn > 0.5) return textureLod(uDeckCov, dirToEquirect(n), 0.0).r;
+  return clamp(cloudFraction(n, 2.0) * uDeckCover, 0.0, 1.0);
 }
 
 vec3 cloudWarp(vec3 P){

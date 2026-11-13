@@ -29,9 +29,14 @@ export class AutoExposurePass extends Pass {
     this.biasEV = 0;          // camera-model bias (e.g. the action cam's brighter metering)
     this.curveGain = 1;       // the tone curve's own input gain is missing (three's ACES has x 1/0.6)
     this.flatMetering = false; // whole-frame average including black space (action cam)
-    this.minEV = -1.5; this.maxEV = 2.5;
+    // maxEV 3 (was 2.5): moonlit nights sit near 2.5 anyway; only the darkest moonless frames open
+    // up to half a stop further instead of hitting the ceiling
+    this.minEV = -1.5; this.maxEV = 3.0;
+    this.hiTarget = 0.8;      // exposed brightness-weighted mean may not exceed this (highlight protection)
     this.dt = 0.016;
     this.reset = true;
+    this.ev = this.maxEV;       // last applied auto EV, read back a few frames late (pollEV)
+    this._evBuf = new Float32Array(4); this._evBusy = false; this._evFrame = 0; this._evStall = 0;
 
     this.measure = new FullScreenQuad(new THREE.ShaderMaterial({
       uniforms: { tSrc: { value: null }, uFlat: { value: 0 } },
@@ -46,8 +51,13 @@ export class AutoExposurePass extends Pass {
           float w = mix(exp(-dot(c, c) * 6.0), 1.0, uFlat);   // centre-weighted (or flat) metering
           // ignore black space (unless metering flat) and the sun disc itself
           float valid = max(step(1e-4, l), uFlat) * step(l, 60.0);
+          // B/A = sum(l^2) / sum(l): the brightness-weighted mean luminance, i.e. the level where
+          // most of the frame's light sits (the bright regions), however much of the frame is dark.
+          // For highlight protection; space and the sun disc are excluded, glints capped.
+          float lit = step(1e-4, l) * step(l, 60.0);
+          float lc = min(l, 20.0) * lit;
           l = max(l, 0.02);                              // flat metering: black counts as deep shadow
-          gl_FragColor = vec4(log(max(l, 1e-4)) * w * valid, w * valid, 0.0, 1.0);
+          gl_FragColor = vec4(log(max(l, 1e-4)) * w * valid, w * valid, lc * lc, lc);
         }`,
       depthTest: false, depthWrite: false,
     }));
@@ -57,10 +67,10 @@ export class AutoExposurePass extends Pass {
       fragmentShader: /* glsl */ `
         uniform sampler2D tSrc; uniform float uTexel; varying vec2 vUv;
         void main(){
-          vec2 s = vec2(0.0);
+          vec4 s = vec4(0.0);
           for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++)
-            s += texture2D(tSrc, vUv + (vec2(float(x), float(y)) - 1.5) * uTexel).rg;
-          gl_FragColor = vec4(s, 0.0, 1.0);
+            s += texture2D(tSrc, vUv + (vec2(float(x), float(y)) - 1.5) * uTexel);
+          gl_FragColor = s;
         }`,
       depthTest: false, depthWrite: false,
     }));
@@ -70,26 +80,45 @@ export class AutoExposurePass extends Pass {
       fragmentShader: /* glsl */ `
         uniform sampler2D tCur, tPrev; uniform float uDt, uReset; varying vec2 vUv;
         void main(){
-          vec2 c = texture2D(tCur, vec2(0.5)).rg;
+          vec4 c = texture2D(tCur, vec2(0.5));
           float cur = c.y > 1e-3 ? c.x / c.y : log(0.06);
-          float prev = texture2D(tPrev, vec2(0.5)).r;
-          float speed = cur > prev ? 2.2 : 1.1;
+          float curHi = c.w > 1e-6 ? log(max(c.z / c.w, 1e-6)) : log(0.06);   // log brightness-weighted mean
+          // ...relaxed when the bright region is small. (sum l)^2 / (N sum l^2) is the share of the
+          // frame the light sits in (p for p of the frame at one level). A brightness-weighted mean
+          // protects a thin sunset arc or a glint as hard as a frame-filling sunlit Earth: at orbital
+          // sunset it held the frame ~3.4 stops under the scene, the spacecraft a black silhouette,
+          // then let go at once when the sun set. Small bright areas may now clip (up to 2.5 stops).
+          float share = c.z > 1e-9 ? c.w * c.w / (4096.0 * c.z) : 1.0;
+          curHi -= clamp(-log2(max(share, 1e-4) / 0.15) * 0.6, 0.0, 2.5) * log(2.0);
+          vec2 prev = texture2D(tPrev, vec2(0.5)).rg;
+          // brighter scene: close down fast; darker scene: open up slowly (~2 s time constant). At
+          // orbital sunset the sun's glare leaves the frame in ~2 s: at 1.1/s the exposure leapt ~3
+          // stops right after it and the silhouetted spacecraft popped out navy at once
+          float speed = cur > prev.x ? 2.2 : 0.5;
+          float speedHi = curHi > prev.y ? 2.2 : 0.5;
           float a = uReset > 0.5 ? 1.0 : 1.0 - exp(-uDt * speed);
-          gl_FragColor = vec4(mix(prev, cur, a), 0.0, 0.0, 1.0);
+          float aHi = uReset > 0.5 ? 1.0 : 1.0 - exp(-uDt * speedHi);
+          gl_FragColor = vec4(mix(prev.x, cur, a), mix(prev.y, curHi, aHi), 0.0, 1.0);
         }`,
       depthTest: false, depthWrite: false,
     }));
     this.apply = new FullScreenQuad(new THREE.ShaderMaterial({
       uniforms: {
         tDiffuse: { value: null }, tAdapt: { value: null }, uBase: { value: 0.5 }, uRef: { value: 0.06 },
-        uComp: { value: 0 }, uMin: { value: -1.5 }, uMax: { value: 2.5 }, uAuto: { value: 1 },
+        uComp: { value: 0 }, uMin: { value: -1.5 }, uMax: { value: 2.5 }, uAuto: { value: 1 }, uHiTarget: { value: 0.8 },
       },
       vertexShader: quadVert,
       fragmentShader: /* glsl */ `
-        uniform sampler2D tDiffuse, tAdapt; uniform float uBase, uRef, uComp, uMin, uMax, uAuto; varying vec2 vUv;
+        uniform sampler2D tDiffuse, tAdapt; uniform float uBase, uRef, uComp, uMin, uMax, uAuto, uHiTarget; varying vec2 vUv;
         void main(){
           // compensate 75 % of the difference, as a camera's metering bias does: dim scenes stay a little dim
-          float ev = uAuto > 0.5 ? clamp(0.75 * (log2(uRef) - texture2D(tAdapt, vec2(0.5)).r / log(2.0)), uMin, uMax) : 0.0;
+          vec2 m = texture2D(tAdapt, vec2(0.5)).rg;
+          float ev = 0.75 * (log2(uRef) - m.x / log(2.0));
+          // highlight protection: a dark frame with a bright region (sunlit limb beside the night
+          // side, dawn haze) would otherwise be pushed up until that region clips flat white; cap
+          // the exposure so the bright regions' level stays at uHiTarget after exposure
+          ev = min(ev, log2(uHiTarget / uBase) - m.y / log(2.0));
+          ev = uAuto > 0.5 ? clamp(ev, uMin, uMax) : 0.0;
           gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb * uBase * exp2(ev + uComp), 1.0);
         }`,
       depthTest: false, depthWrite: false,
@@ -97,6 +126,38 @@ export class AutoExposurePass extends Pass {
   }
 
   get adapted() { return this.adapt[this.ping].texture; }
+
+  // CPU copy of the exposure the apply pass uses (same formula, without the user's compensation),
+  // refreshed every 8 frames without stalling.
+  pollEV(renderer) {
+    if (!this.auto) { this.ev = this.maxEV; return; }
+    if (this._evFrame++ & 7) return;
+    // the async read can stall (a hidden tab polls its fence rarely): after ~8 polls without an
+    // answer, read synchronously once (a 1x1 float read) so the night boost isn't fed a stale EV
+    if (this._evBusy) {
+      if (++this._evStall < 8) return;
+      const gl = renderer.getContext();
+      if (gl.PIXEL_PACK_BUFFER) gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+      renderer.readRenderTargetPixels(this.adapt[this.ping], 0, 0, 1, 1, this._evBuf);
+      this._applyEV();
+      this._evStall = 0;
+      return;
+    }
+    if (!renderer.readRenderTargetPixelsAsync) return;
+    this._evBusy = true; this._evStall = 0;
+    renderer.readRenderTargetPixelsAsync(this.adapt[this.ping], 0, 0, 1, 1, this._evBuf)
+      .then(() => this._applyEV())
+      .catch(() => {})
+      .finally(() => { this._evBusy = false; });
+  }
+
+  _applyEV() {
+    const b = this._evBuf;
+    let ev = 0.75 * (Math.log2(this.refLum) - b[0] / Math.LN2);
+    ev = Math.min(ev, Math.log2(this.hiTarget / (this.base * this.curveGain)) - b[1] / Math.LN2);
+    if (Number.isFinite(ev)) this.ev = Math.min(Math.max(ev, this.minEV), this.maxEV);
+  }
+
 
   render(renderer, writeBuffer, readBuffer) {
     if (this.auto) {
@@ -120,6 +181,7 @@ export class AutoExposurePass extends Pass {
     a.tDiffuse.value = readBuffer.texture; a.tAdapt.value = this.adapted;
     a.uBase.value = this.base * this.curveGain; a.uRef.value = this.refLum; a.uComp.value = this.compEV + this.biasEV;
     a.uMin.value = this.minEV; a.uMax.value = this.maxEV; a.uAuto.value = this.auto ? 1 : 0;
+    a.uHiTarget.value = this.hiTarget;
     renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer);
     this.apply.render(renderer);
   }
