@@ -1,0 +1,16 @@
+{
+ "date": "2026-10-11",
+ "width": 32768,
+ "height": 16384,
+ "tile": 8192,
+ "cols": 4,
+ "rows": 2,
+ "format": "bc4",
+ "mips": 12,
+ "value": "cloud signal, ~reflectance / 0.85",
+ "cityglow": {
+  "file": "cityglow.png",
+  "lmax": 6553.5,
+  "encoding": "v = 255 log2(1+L)/log2(1+lmax)"
+ }
+}
