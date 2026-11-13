@@ -39,6 +39,19 @@ export const tileCache = { available: false };
 if (location.protocol.startsWith('http')) {
   fetch('tiles/stats').then((r) => { tileCache.available = r.ok; }).catch(() => {});
 }
+// Night lights: NASA Black Marble. Currently baked by tools/bake_lights_bm.py from the cached GIBS
+// Black Marble 2016 tiles (~600 m, zoom 8), calibrated to VNP46A4 radiance; tools/bake_lights.py
+// bakes the full VNP46A4 product (~460 m, zoom 9) instead. Either way data/lights/ holds Web
+// Mercator tiles holding the radiance
+// itself (nW/cm^2/sr x 10, 16 bit in R/G), plus index.json listing every lit tile. Streamed per
+// tile like the imagery; a tile missing from the index is dark.
+const LIGHTS_DIR = 'data/lights/';
+const lightsIndex = { maxZoom: 9, tiles: null };
+if (location.protocol.startsWith('http')) {
+  fetch(LIGHTS_DIR + 'index.json', { cache: 'no-cache' }).then((r) => (r.ok ? r.json() : null)).then((j) => {
+    if (j) { lightsIndex.maxZoom = j.maxZoom; lightsIndex.tiles = new Set(j.tiles); }
+  }).catch(() => {});
+}
 const DIRECT = { s2: s2Url, dem: terrainUrl };
 export const tileUrl = (src, z, x, y) => (tileCache.available ? `tiles/${src}/${z}/${x}/${y}` : DIRECT[src](z, x, y));
 
@@ -83,8 +96,36 @@ uniform vec4 uHXform;
 uniform float uHasHeight;
 uniform float uHTexelKm;
 uniform float uExag;
-uniform sampler2D uNight;
-uniform float uLights;
+uniform vec3 uMoonDir;     // Lighting hub: moon direction, irradiance (phase applied), night-sky floor
+uniform float uMoonE;
+uniform float uNightGlowE;
+uniform float uLights;     // night-light gain
+uniform float uCityLand;   // night: the land around the cities lit by their light (0 = off)
+uniform sampler2D uCityGlow;   // city radiance blurred ~15 km, equirect, log-encoded (bake_photo_clouds.py)
+uniform float uCityGlowOn;
+float cityGlowAt(vec3 n){
+  float v = textureLod(uCityGlow, dirToEquirect(n), 0.0).r;
+  return exp2(v * 12.678) - 1.0;   // log2(1 + 6553.5)
+}
+uniform float uTwilight;   // terminator effects (golden hour, twilight glow, staggered city lights): 0 off, 1 on
+#ifndef GLOBAL_MAP
+uniform sampler2D uLightsTex;   // Black Marble radiance tile (or ancestor) under this tile
+uniform vec4 uLXform;
+uniform float uHasLights;
+// radiance, nW/cm^2/sr: 16-bit value x 0.1, R = high byte, G = low byte (tools/bake_lights.py);
+// packed, so filtered by hand (bilinear on the decoded radiance)
+float lightsRad(ivec2 t){
+  vec2 rg = texelFetch(uLightsTex, clamp(t, ivec2(0), ivec2(255)), 0).rg * 255.0;
+  return (rg.x * 256.0 + rg.y) * 0.1;
+}
+float lightsAt(vec2 uv){
+  vec2 p = clamp(uv, 0.0, 1.0) * 256.0 - 0.5;
+  vec2 f = fract(p);
+  ivec2 i = ivec2(floor(p));
+  return mix(mix(lightsRad(i), lightsRad(i + ivec2(1, 0)), f.x),
+             mix(lightsRad(i + ivec2(0, 1)), lightsRad(i + ivec2(1, 1)), f.x), f.y);
+}
+#endif
 uniform float uLandGain;
 varying vec3 vWorld;
 varying vec2 vUv;
@@ -108,7 +149,6 @@ void main(){
 #else
   vec3 alb = texture2D(uMap, vUv * uUvXform.zw + uUvXform.xy, uFadeBias).rgb;
 #endif
-  vec3 night = texEquirect(uNight, N).rgb;
   float NdLg = dot(N, L);
 
   // ---- terrain: relief normal + self-shadowing from the elevation tile ----
@@ -168,12 +208,18 @@ void main(){
   float fpIso = min(length(dFdx(P)), length(dFdy(P)));
   float lodS = cloudLod(fpIso);
   float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-  float cloudSh = (NdLg > -0.08 && uCloudCover > 0.0) ? cloudShadowAt(P + N * 0.02, L, lodS, jit) : 1.0;
+  // built-in clouds off (CLOUDS_ENABLED): their lookup is compiled out, which frees their six
+  // samplers (the shader sits at the 16-unit limit)
+  float cloudSh = ${CLOUDS_ENABLED ? '(NdLg > -0.08 && uCloudCover > 0.0) ? cloudShadowAt(P + N * 0.02, L, lodS, jit) : 1.0' : '1.0'};
   // shared cloud shadow map (Lighting hub; exactly 1 while no cloud provider is attached): feeds
   // direct sun, skylight, sea reflections and the haze dimming below, like the built-in clouds
   cloudSh *= cloudShadowT(P + N * 0.02);
   vec3 Tsun = sunTransmittance(Rg + max(h, 0.0) + 0.05, NdLg);
   vec3 E = uSunE * Tsun * cloudSh * terrShadow;
+  // golden hour: the last ~9 degrees before the terminator warm toward amber, beyond the plain
+  // air-mass reddening of the transmittance LUT (low sun through aerosol and dust)
+  float gold = uTwilight * (1.0 - smoothstep(0.0, 0.16, NdLg)) * smoothstep(-0.03, 0.01, NdLg);
+  E *= mix(vec3(1.0), vec3(1.35, 0.88, 0.5), gold);
   // skylight from the precomputed irradiance table (real dawn sky colour and strength), reduced by
   // the ray-traced terrain horizon, the facet's tilt and cloud cover overhead
   float tilt = 0.5 + 0.5 * dot(Nt, N);                 // share of the sky dome a sloped facet faces
@@ -235,12 +281,115 @@ void main(){
     col = mix(col, waterCol, water);
   }
 
-  // ---- night lights ----
+  // ---- night side: moonlight and night-sky ambient ----
   float nightF = smoothstep(0.06, -0.14, NdLg);
   if (nightF > 0.0){   // day side skips the noise entirely
-    float sparkle = smoothstep(-0.2, 0.7, snoise(P * 0.9)) * 0.7 + smoothstep(0.1, 0.9, snoise(P * 2.7 + 4.0)) * 0.6;
-    float covHere = uCloudCover > 0.0 ? cloudFraction(N, 2.0) * min(uCloudCover, 1.0) : 0.0;
-    col += night * night * nightF * uLights * (0.35 + sparkle) * (1.0 - 0.8 * covHere);
+    // moonlight (real position and phase) + airglow/starlight floor: what shows the land at night
+    float NdM = dot(N, uMoonDir);
+    // cool tint: moonlit scenes read blue-grey to the dark-adapted eye and in night photography
+    vec3 Em = uMoonE * vec3(0.72, 0.86, 1.2) * sunTransmittance(Rg + max(h, 0.0) + 0.05, NdM) * smoothstep(-0.02, 0.06, NdM);
+    // night vision is nearly colourless: the land keeps a trace of its hue under the moon and
+    // almost none under the sky floor, which is ambient and so darkens with the terrain's sky view
+    // Long-exposure night photos from orbit: land is dark navy with relief, snow and bright ground
+    // stand out only moderately (albedo compressed, so deserts never turn white), the sea is deep
+    // blue. Albedo keeps a trace of its hue under the moon and almost none under the ambient.
+    float albL = dot(landAlb, vec3(0.2126, 0.7152, 0.0722));
+    // hard compression keeps deserts close to forest (no white Sahara); snow, bright and colourless
+    // unlike warm sand, is lifted back so mountain ranges glow as in the photos
+    float aMax = max(landAlb.r, max(landAlb.g, landAlb.b));
+    float aSat = (aMax - min(landAlb.r, min(landAlb.g, landAlb.b))) / max(aMax, 1e-3);
+    float snowM = smoothstep(0.45, 0.7, albL) * (1.0 - smoothstep(0.08, 0.2, aSat));
+    float albC = albL / (albL + 0.08) * 0.17 + 0.22 * snowM;
+    vec3 moonAlb = mix(vec3(albC), landAlb * (albC / max(albL, 1e-3)), 0.35);
+    vec3 glowAlb = mix(vec3(albC), landAlb * (albC / max(albL, 1e-3)), 0.08);
+    vec3 nightAmb = uNightGlowE * vec3(0.42, 0.62, 1.15);   // blue cast of the night exposures
+    vec3 moonLand = (moonAlb * Em * max(dot(Nt, uMoonDir), 0.0)
+      + glowAlb * nightAmb * skyOpen * tilt) / PI;
+    // the night sea reads deep blue (moonlit sky reflected), brighter toward the limb
+    float seaF = 0.55 + 1.6 * pow(1.0 - max(dot(N, V), 0.0), 3.0);
+    vec3 moonSea = vec3(0.025, 0.05, 0.11) / PI * (Em * max(NdM, 0.0) + nightAmb * seaF);
+    if (water > 0.01 && NdM > 0.0){
+      // moon glint: one broad Cox-Munk lobe, as in astronaut photos of a moonlit sea
+      vec3 Hm = normalize(uMoonDir + V);
+      float NdHm = max(dot(N, Hm), 0.0);
+      float am = 0.0324, ddm = NdHm * NdHm * (am - 1.0) + 1.0;
+      float Fm = 0.02 + 0.98 * pow(1.0 - max(dot(Hm, V), 0.0), 5.0);
+      moonSea += Em * (am / (PI * ddm * ddm)) * Fm / (4.0 * max(dot(N, V), 0.05));
+    }
+    // the moon and the sky floor are there right from the terminator (the city lights keep nightF's
+    // slower switch-on): with nightF they only reached full strength 8 degrees past it, leaving a
+    // dark band between the fading twilight and the night ambient
+    float ambF = smoothstep(0.06, -0.03, NdLg);
+    col += mix(moonLand, moonSea, water) * ambF;
+    // twilight: after sunset the ground is still lit by the sunlit sky overhead. Warm just past the
+    // line, then blue, falling ~e-fold every 2 degrees of sun depression to nothing by ~12 degrees.
+    float dep = -NdLg;
+    if (uTwilight > 0.0 && dep > -0.02 && dep < 0.22){
+      vec3 twCol = mix(vec3(1.0, 0.5, 0.25), vec3(0.22, 0.34, 0.95), smoothstep(0.0, 0.07, dep));
+      float twE = uSunE * 0.006 * exp(-max(dep, 0.0) / 0.035) * smoothstep(-0.02, 0.02, dep) * uTwilight;
+      col += mix(landAlb * skyOpen, vec3(0.02, 0.04, 0.07), water) / PI * twE * twCol;
+    }
+    float Lhere = 0.0;   // this pixel's own night light (the terrain lift below leaves it alone)
+#ifndef GLOBAL_MAP
+    // night lights: the measured radiance as published, added on the night side, tinted like
+    // cities seen from orbit — sodium amber in dim suburbs, paler gold where cores saturate
+    // (both colours luminance-normalised, so brightness matches the untinted radiance)
+    if (uHasLights > 0.5){
+      float Lraw = lightsAt(vUv * uLXform.zw + uLXform.xy);
+      // Black Marble 2016 clips big-city cores flat at ~32.8 nW (17 % of Tokyo's tile sits at the
+      // cap): a featureless plateau that, tinted amber, clipped to a flat yellow blob (user,
+      // 2026-11-14: "blown colors"). Inside the plateau the real city underneath gives it back its
+      // structure -- concrete and roads brighter, parks darker, rivers and bays dark (S2 imagery
+      // albedo) -- and the brightest values roll off softly toward pale gold instead of clipping.
+      float sat = smoothstep(16.0, 32.0, Lraw);
+      float albU = dot(landAlb, vec3(0.2126, 0.7152, 0.0722));
+      float urban = clamp(pow(albU / 0.11, 1.8), 0.2, 1.8);   // city albedo varies little: stretched
+      Lraw *= mix(1.0, urban * (1.0 - 0.8 * water), sat);
+      float Llin = Lraw * uLights;
+      float L = 0.34 * (1.0 - exp(-Llin / 0.34));   // knee near the data's cap
+      vec3 tint = mix(vec3(1.48, 0.92, 0.41), vec3(1.12, 1.0, 0.8), smoothstep(0.08, 0.3, L));
+      // dusk switch-on: each ~2 km patch turns on at its own sun depression (0.3-4.5 degrees), so
+      // cities sparkle on across the terminator instead of shining through daylight
+      float cell = fract(sin(dot(floor(P * 0.6), vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+      float onAt = -0.005 - 0.073 * cell;
+      float lightsOn = mix(nightF, smoothstep(onAt + 0.012, onAt - 0.012, NdLg), uTwilight);
+      col += tint * L * lightsOn;
+      Lhere = L;
+    }
+#endif
+    // The terrain around the cities, lit by their light (user, 2026-11-13: "some of the terrain
+    // visible" -- the lights themselves unchanged). The source is the city radiance blurred over
+    // ~15 km, so hills and valleys tens of km out pick it up; it comes from above and from where
+    // the glow is brighter (its gradient), so slopes facing the city brighten and relief reads.
+    // The night's albedo (hue partly kept, deserts compressed), the night blue; only where the
+    // pixel itself has no light of its own.
+    if (uCityGlowOn > 0.5 && uCityLand > 0.0){
+      float G = cityGlowAt(N) * uLights;
+      if (G > 1e-4){
+        vec3 Eo = normalize(vec3(N.z, 0.0, -N.x) + vec3(1e-6, 0.0, 0.0)), No = cross(N, Eo);
+        float dk = 12.0 / Rg;   // ~12 km
+        float gE = cityGlowAt(normalize(N + Eo * dk)) * uLights, gN = cityGlowAt(normalize(N + No * dk)) * uLights;
+        vec3 Lc = normalize(N + (Eo * (gE - G) + No * (gN - G)) / max(G, 1e-3) * 1.5);
+        float shade = clamp(max(dot(Nt, Lc), 0.0) / max(dot(N, Lc), 0.2), 0.0, 2.5);
+        // Saturates early: Tokyo's hills (G ~0.005-0.015) and the desert beside the Nile (G ~0.06-0.12,
+        // a narrow, very bright source blurred wide) end up within ~1.6x instead of 5-10x, which drew
+        // wide white halos over the desert (user, 2026-11-14)
+        // and only where there is real light nearby: faint glow far out (open desert ~60 km from the
+        // Nile, G ~0.005) gets none -- wide areas of dim lit land lower the auto exposure's metered
+        // average (it ignores black), which brightened the whole frame, lights and clouds included
+        float lit = smoothstep(0.002, 0.025, G) * G / (G + 0.01);
+        float mine = 1.0 - smoothstep(0.003, 0.05, Lhere);
+        vec3 Ec = uCityLand * vec3(0.42, 0.62, 1.15) * lit * mine * smoothstep(0.0, -0.08, NdLg);
+        // albedo flattened further (sand ~1.35x forest, not 2-3x): the relief carries the detail
+        vec3 albT = moonAlb / (dot(moonAlb, vec3(0.2126, 0.7152, 0.0722)) + 0.06) * 0.1;
+        // Shown through relief: flat land (deserts, plains) gets only a faint share, which kept
+        // drawing smooth halos around bright valleys like the Nile; slopes get the full directional
+        // shading, so hills and mountains read the same way everywhere (user, 2026-11-14)
+        float slope = 1.0 - dot(Nt, N);
+        float form = mix(0.3, shade, smoothstep(0.004, 0.04, slope));
+        col += mix(albT * form * skyOpen, vec3(0.001, 0.002, 0.004), water) / PI * Ec;   // land, not sea
+      }
+    }
   }
 
   vec3 S, T;
@@ -248,6 +397,13 @@ void main(){
   // the lowest air column (below the cloud deck) is shadowed too; approximate by dimming a share
   // of the in-scatter in cloud shadow — makes shadows read over the hazy ocean like in photos
   S *= mix(1.0, 0.62, 1.0 - cloudSh);
+  // terminator glow: the low air along the day-night line is lit by reddened, grazing sunlight —
+  // an amber band on the day side shading to rose just past it, scaled by how much air is in view
+  if (uTwilight > 0.0){
+    float band = exp(-pow((NdLg - 0.012) / 0.028, 2.0));
+    vec3 glowCol = mix(vec3(0.95, 0.3, 0.3), vec3(1.0, 0.48, 0.12), smoothstep(-0.02, 0.03, NdLg));
+    S += uSunE * 0.009 * uTwilight * band * (1.0 - T.g) * glowCol;
+  }
   gl_FragColor = vec4(col * T + S, 1.0);
 }`;
 
@@ -363,13 +519,78 @@ const skyFrag = /* glsl */ `
 #define ATM_STEPS 24
 ${commonGLSL}
 ${atmosphereGLSL}
+uniform float uAirglow;
 varying vec3 vWorld;
+// ---- airglow: layered night-sky emission, integrated along the ray ----
+// Emission per km of path vs height (relative to the green line's peak), as photographed from
+// orbit: the OI 557.7 nm green line (peak ~96 km, ~10 km FWHM, a little sharper on its
+// upper side), the OH Meinel / Na layer just below it (~87 km, reads warm yellow-orange on
+// camera sensors), and the faint, very broad OI 630 nm red layer of the F region (~250 km).
+vec3 airglowEmit(float h){
+  float up = h > 96.0 ? 3.0 : 4.0;
+  float g = exp(-0.5 * pow((h - 96.0) / up, 2.0));
+  float o = exp(-0.5 * pow((h - 87.0) / 3.0, 2.0));
+  return g * vec3(0.40, 1.0, 0.24) + o * 0.07 * vec3(1.0, 0.55, 0.18);
+}
+vec3 redEmit(float h){ return exp(-0.5 * pow((h - 250.0) / 45.0, 2.0)) * 0.018 * vec3(1.0, 0.16, 0.10); }
+// along-path length between radii a < b for a ray whose closest approach to the centre is p:
+// s(r) = sqrt(r^2 - p^2), exact for each step, so the tangent point's 1/sqrt singularity is fine
+float sOf(float r, float p2){ return sqrt(max(r * r - p2, 0.0)); }
+vec3 glowSeg(float a, float b, float p2, float lo, float hi, int which){
+  a = max(a, lo); b = min(b, hi);
+  if (b <= a) return vec3(0.0);
+  vec3 acc = vec3(0.0);
+  const int N = 18;
+  float dr = (b - a) / float(N), s0 = sOf(a, p2);
+  for (int i = 0; i < N; i++){
+    float r1 = a + dr * float(i + 1), s1 = sOf(r1, p2);
+    float h = r1 - 0.5 * dr - Rg;
+    acc += (which == 0 ? airglowEmit(h) : redEmit(h)) * (s1 - s0);
+    s0 = s1;
+  }
+  return acc;
+}
+// the emission seen along [0, tMax): the inward leg down to the tangent point (or the ground),
+// then the outward leg if the ray misses the planet, dimmed by farT: its light crosses the
+// dense air around the tangent point (what leaves the dark gap above the limb)
+vec3 airglowPath(vec3 ro, vec3 rd, bool hitsGround, float lo, float hi, int which, vec3 farT){
+  float rc = length(ro), tT = -dot(ro, rd);
+  float p2 = max(dot(ro, ro) - tT * tT, 0.0), p = sqrt(p2);
+  vec3 L = vec3(0.0);
+  if (tT > 0.0){
+    L += glowSeg(max(p, Rg), rc, p2, lo, hi, which);
+    if (!hitsGround) L += glowSeg(p, 1e9, p2, lo, hi, which) * farT;
+  } else {
+    L += glowSeg(rc, 1e9, p2, lo, hi, which);
+  }
+  return L;
+}
+float agHash(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float agNoise(vec3 x){
+  vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(agHash(i), agHash(i + vec3(1,0,0)), f.x), mix(agHash(i + vec3(0,1,0)), agHash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(agHash(i + vec3(0,0,1)), agHash(i + vec3(1,0,1)), f.x), mix(agHash(i + vec3(0,1,1)), agHash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
 void main(){
   vec3 rd = normalize(vWorld - cameraPosition);
   vec2 tg = raySphere(cameraPosition, rd, Rg);
   float tMax = tg.x > 0.0 ? tg.x : 1e9;
   vec3 S, T;
   atmosphere(cameraPosition, rd, tMax, S, T);
+  // Airglow: seen edge-on, the emitting layers' path is ~40x the vertical one, so they draw the
+  // thin glowing band that floats just above the night limb in astronaut photos, with a dark
+  // gap of clear air under it. Soft-edged emission profiles (not a hard slab), a warm fringe
+  // below the green, a ghost of red above, and the gentle patchiness of gravity waves along it.
+  if (uAirglow > 0.0){
+    bool hitsGround = tg.x > 0.0;
+    vec3 E = airglowPath(cameraPosition, rd, hitsGround, Rg + 70.0, Rg + 125.0, 0, T)
+           + airglowPath(cameraPosition, rd, hitsGround, Rg + 140.0, Rg + 380.0, 1, T);
+    vec3 pt = cameraPosition - rd * dot(cameraPosition, rd);   // tangent point (closest approach)
+    vec3 pn = normalize(pt);
+    float dark = smoothstep(0.05, -0.2, dot(pn, uSunDir));
+    float waves = 0.78 + 0.32 * agNoise(pn * 22.0) + 0.12 * agNoise(pn * 75.0);
+    S += uAirglow * E * dark * waves;
+  }
   gl_FragColor = vec4(S, 1.0);
 }`;
 
@@ -410,16 +631,20 @@ const starVert = /* glsl */ `
 attribute float aMag;
 attribute vec3 aCol;
 varying vec3 vCol;
-uniform float uStarI;
+uniform float uStarI, uStarGamma;
 void main(){
-  vCol = aCol * aMag * uStarI;
+  // uStarGamma < 1 lifts the faint stars more than the bright ones (the daylight star field)
+  vCol = aCol * pow(aMag, uStarGamma) * uStarI;
   vec4 mv = modelViewMatrix * vec4(position, 1.0);
   gl_Position = projectionMatrix * mv;
   gl_PointSize = 1.0 + aMag * 1.6;
 }`;
 const starFrag = /* glsl */ `
 varying vec3 vCol;
+uniform sampler2D tDepth; uniform vec2 uRes; uniform float uUseDepth;
 void main(){
+  // drawn after the depth-of-field blur (main.js SceneStagePass): hidden where the ground is in front
+  if (uUseDepth > 0.5 && texture2D(tDepth, gl_FragCoord.xy / uRes).r < 1.0) discard;
   vec2 p = gl_PointCoord * 2.0 - 1.0;
   float a = exp(-dot(p, p) * 3.0);
   gl_FragColor = vec4(vCol * a, 1.0);
@@ -515,6 +740,8 @@ class TileManager {
     this.fadeMs = 400;
     this.preload = true;   // off: only on-screen tiles load (old behaviour; for comparisons)     // cross-fade when sharper imagery replaces a coarser stand-in
     this.hInflight = 0;
+    this.ltiles = new Map();   // streamed night-light tiles, keyed z/x/y
+    this.lInflight = 0;
     this.exag = 1.0;
     this.renderer = renderer;
     this.bakeCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -581,6 +808,55 @@ class TileManager {
   }
 
   get maxZ() { return this.hiRes ? 13 : 8; }
+
+  // Night-light tile for ground tile t (its zoom capped at 8), or the closest loaded ancestor while
+  // it streams in, as [light tile, levels up]; queues missing ones.
+  lightsFor(t, queue) {
+    const idx = lightsIndex.tiles;
+    if (!idx) return null;
+    let z = Math.min(t.z, lightsIndex.maxZoom), d = t.z - z, x = t.x >> d, y = t.y >> d, tries = 0;
+    for (;;) {
+      const key = `${z}/${x}/${y}`;
+      if (!idx.has(key)) {   // dark here (tile itself) or no coarser stand-in (ancestor)
+        if (tries === 0) return null;
+        if (z <= 0) return null;
+        z--; x >>= 1; y >>= 1; d++; tries++;
+        continue;
+      }
+      let n = this.ltiles.get(key);
+      if (!n) { n = { z, x, y, key, state: ST_NONE, texture: null, lastUsed: this.frame }; this.ltiles.set(key, n); }
+      n.lastUsed = this.frame;
+      if (n.state === ST_READY) return [n, d];
+      if (n.state === ST_NONE && tries < 2) queue.push(n);
+      if (n.state === ST_ERROR && this.frame - n.errorFrame > 600 && tries < 2) { n.state = ST_NONE; queue.push(n); }
+      tries++;
+      if (z <= 0) return null;
+      z--; x >>= 1; y >>= 1; d++;
+    }
+  }
+
+  loadLights(n) {
+    n.state = ST_LOADING;
+    this.lInflight++;
+    fetch(`${LIGHTS_DIR}${n.z}/${n.x}/${n.y}.png`)
+      .then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); })
+      .then((b) => createImageBitmap(b, { colorSpaceConversion: 'none', premultiplyAlpha: 'none' }))
+      .then((bmp) => {
+        const tex = new THREE.Texture(bmp);
+        tex.colorSpace = THREE.NoColorSpace;   // packed 16-bit radiance: exact bytes, no filtering
+        tex.flipY = false;
+        tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+        tex.minFilter = tex.magFilter = THREE.NearestFilter;
+        tex.generateMipmaps = false;
+        tex.needsUpdate = true;
+        this.renderer.initTexture(tex);
+        n.texture = tex;
+        n.state = ST_READY;
+      })
+      .catch(() => { n.state = ST_ERROR; n.errorFrame = this.frame; })
+      .finally(() => { this.lInflight--; });
+  }
+
 
   get(z, x, y) {
     const key = `${z}/${x}/${y}`;
@@ -733,7 +1009,7 @@ class TileManager {
     for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) visit(this.get(2, x, y));
 
     for (const t of this.visible) if (t.mesh) t.mesh.visible = false;
-    const wanted = [], hwanted = [];
+    const wanted = [], hwanted = [], lwanted = [];
     const now = performance.now();
     // the DEM tile (or closest ready ancestor) for tile t, as [tile, levels up]; queues missing ones
     const heightFor = (t, queue) => {
@@ -785,6 +1061,13 @@ class TileManager {
         u.uHTexelKm.value = 2 * Math.PI * R_EARTH / 2 ** hs.z / 256;
         u.uHasHeight.value = 1;
       } else u.uHasHeight.value = 0;
+      const lt = this.lightsFor(t, lwanted);
+      if (lt) {
+        const [ls, ld] = lt, lsc = 1 / 2 ** ld;
+        u.uLightsTex.value = ls.texture;
+        u.uLXform.value.set((t.x - (ls.x << ld)) * lsc, (t.y - (ls.y << ld)) * lsc, lsc, lsc);
+        u.uHasLights.value = 1;
+      } else u.uHasLights.value = 0;
       t.mesh.visible = true;
     }
     this.visible = selected;
@@ -846,6 +1129,12 @@ class TileManager {
       if (this.hInflight >= 16) break;
       if (t.hstate === ST_NONE) this.loadHeight(t);
     }
+    lwanted.sort((a, b) => a.z - b.z);
+    this.pending += lwanted.length;
+    for (const n of lwanted) {
+      if (this.lInflight >= 8) break;
+      if (n.state === ST_NONE) this.loadLights(n);
+    }
 
     if (this.frame % 60 === 0) this.evict();
   }
@@ -854,6 +1143,14 @@ class TileManager {
     let live = 0;
     for (const t of this.tiles.values()) if (t.texture && this.frame - t.lastUsed <= 90) live++;
     const budget = Math.max(800, Math.ceil(live * 1.5));
+    if (this.ltiles.size > 700) {   // night-light tiles: drop the least recently used
+      const oldL = [...this.ltiles.values()].filter((n) => n.state !== ST_LOADING && this.frame - n.lastUsed > 90)
+        .sort((a, b) => a.lastUsed - b.lastUsed);
+      for (const n of oldL.slice(0, this.ltiles.size - 500)) {
+        n.texture?.dispose(); n.texture?.image?.close?.();
+        this.ltiles.delete(n.key);
+      }
+    }
     if (this.loadedCount <= budget && this.tiles.size < 6000) return;
     const old = [...this.tiles.values()].filter((t) => this.frame - t.lastUsed > 90).sort((a, b) => a.lastUsed - b.lastUsed);
     for (const t of old) {
@@ -877,7 +1174,6 @@ export function createWorld(renderer, manager, lighting) {
 
   const loader = new THREE.TextureLoader(manager);
   const dayTex = loader.load(TEX_BASE + 'earth_day_4096.jpg');
-  const nightTex = loader.load(TEX_BASE + 'earth_night_4096.jpg');
   // The source is global, but only a broad weather signal is needed inside the active flight
   // corridor. Downsample before GPU upload: 1024x512 is ample for synoptic cloud placement and
   // uses one sixteenth of the texture memory of the 4096 map.
@@ -888,12 +1184,16 @@ export function createWorld(renderer, manager, lighting) {
     cloudCanvas.width = 1024; cloudCanvas.height = 512;
     const ctx = cloudCanvas.getContext('2d', { alpha: false });
     ctx.drawImage(image, 0, 0, cloudCanvas.width, cloudCanvas.height);
+    // three.js allocates immutable storage (texStorage2D) at the size of the first upload: if a
+    // frame already drew the 2x1 placeholder, re-uploading into it overflows (GL_INVALID_VALUE,
+    // "Offset overflows texture dimensions"). Dispose so the next use allocates at 1024x512.
+    cloudTex.dispose();
     cloudTex.needsUpdate = true;
   });
   const aniso = Math.min(8, renderer.capabilities.getMaxAnisotropy());
-  for (const t of [dayTex, nightTex]) t.colorSpace = THREE.SRGBColorSpace;
+  dayTex.colorSpace = THREE.SRGBColorSpace;
   cloudTex.colorSpace = THREE.NoColorSpace;
-  for (const t of [dayTex, nightTex, cloudTex]) {
+  for (const t of [dayTex, cloudTex]) {
     t.wrapS = THREE.RepeatWrapping; t.wrapT = THREE.ClampToEdgeWrapping; t.anisotropy = aniso;
   }
 
@@ -904,6 +1204,15 @@ export function createWorld(renderer, manager, lighting) {
   const flatTerrain = new THREE.DataTexture(new Uint8Array([0]), 1, 1, THREE.RedFormat);
   flatTerrain.needsUpdate = true;
   const cloudData = { date: CLOUD_DATE, loaded: false };
+  // city radiance blurred ~15 km (from data/lights, baked with the photo clouds): lights the
+  // terrain around the cities at night (uCityLand)
+  if (location.protocol.startsWith('http')) {
+    new THREE.TextureLoader().loadAsync(`data/clouds/${CLOUD_DATE}/photo/cityglow.png`).then((t) => {
+      t.colorSpace = THREE.NoColorSpace; t.wrapS = THREE.RepeatWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+      t.minFilter = t.magFilter = THREE.LinearFilter; t.generateMipmaps = false;
+      shared.uCityGlow.value = t; shared.uCityGlowOn.value = 1;
+    }).catch((e) => console.warn('City glow map unavailable (run tools/bake_photo_clouds.py):', e));
+  }
   if (CLOUDS_ENABLED && location.protocol.startsWith('http')) {
     const base = `data/clouds/${CLOUD_DATE}/`;
     const mk = (image, format) => {
@@ -939,6 +1248,9 @@ export function createWorld(renderer, manager, lighting) {
     ...lighting.uniforms,
     uCloudMap: { value: cloudTex },
     uCloudCover: { value: CLOUDS_ENABLED ? 1.0 : 0.0 },
+    uDeckCover: { value: CLOUDS_ENABLED ? 1.0 : 0.0 },   // the environment probe's 2D cloud deck
+    uDeckCov: { value: flatTerrain },
+    uDeckOn: { value: 0 },
     uCloudCov: { value: cloudTex },
     uCloudCovChan: { value: new THREE.Vector4(0, 0, 1, 0) },
     uCloudProps: { value: fallbackProps },
@@ -951,13 +1263,17 @@ export function createWorld(renderer, manager, lighting) {
     uCloudCut: { value: new THREE.Vector4() },
     uCloudCutOn: { value: 0 },
     uWind: { value: new THREE.Vector3() },
-    uNight: { value: nightTex },
-    uLights: { value: 6.0 },
+    uLights: { value: 0.01 },   // night-light gain per nW/cm^2/sr (~100 nW, a town centre, -> 1)
+    uCityLand: { value: 6.0 },  // night: terrain around the cities lit by their light (earth.js)
+    uCityGlow: { value: flatTerrain },
+    uCityGlowOn: { value: 0 },
+    uTwilight: { value: 1.0 },  // terminator effects on/off
+    uAirglow: { value: 1.8e-4 },   // green-line airglow emission per km of path at its ~96 km peak (night limb band)
     uLandGain: { value: 1.35 },
     uNoise3D: { value: cloudNoise.noise },
     uNoiseLut: { value: cloudNoise.lut },
     uDetailMean: { value: cloudNoise.detailMean },
-    uExag: { value: 1.0 },   // true-scale relief (X exaggerates)
+    uExag: { value: 2.5 },   // relief exaggeration: default the highest step (user choice 2026-11-13); X cycles 1/1.6/2.5
     uCloudSteps: { value: 56 },
   };
 
@@ -966,6 +1282,7 @@ export function createWorld(renderer, manager, lighting) {
       ...shared, uMap: { value: global ? dayTex : null }, uUvXform: { value: new THREE.Vector4(0, 0, 1, 1) },
       uFadeBias: { value: 0 },
       uHeight: { value: null }, uHXform: { value: new THREE.Vector4(0, 0, 1, 1) }, uHasHeight: { value: 0 }, uHTexelKm: { value: 1 },
+      uLightsTex: { value: null }, uLXform: { value: new THREE.Vector4(0, 0, 1, 1) }, uHasLights: { value: 0 },
     },
     vertexShader: groundVert,
     fragmentShader: groundFrag,
@@ -992,6 +1309,17 @@ export function createWorld(renderer, manager, lighting) {
   clouds.layers.set(2); // cheap 2D deck: environment probe only (the main view raymarches volumetric clouds)
   clouds.visible = CLOUDS_ENABLED;
   scene.add(clouds);
+  // Legacy clouds off (the photo clouds draw the sky in a post pass the probe cannot see): the deck
+  // still has to put the real clouds into the probe, or the spacecraft's earthshine and reflections
+  // come from a near-cloudless, ~3x too dark Earth. Their cover map (properties.png R) is enough.
+  if (!CLOUDS_ENABLED && location.protocol.startsWith('http')) {
+    new THREE.TextureLoader().loadAsync(`data/clouds/${CLOUD_DATE}/properties.png`).then((t) => {
+      t.colorSpace = THREE.NoColorSpace; t.wrapS = THREE.RepeatWrapping; t.wrapT = THREE.ClampToEdgeWrapping;
+      t.minFilter = t.magFilter = THREE.LinearFilter; t.generateMipmaps = false;
+      shared.uDeckCov.value = t; shared.uDeckOn.value = 1;
+      clouds.visible = true;
+    }).catch((e) => console.warn('Probe cloud deck unavailable:', e));
+  }
 
   const sky = new THREE.Mesh(
     new THREE.SphereGeometry(R_ATMO, 256, 128),
@@ -1018,7 +1346,7 @@ export function createWorld(renderer, manager, lighting) {
   sg.setAttribute('position', new THREE.BufferAttribute(sp, 3));
   sg.setAttribute('aMag', new THREE.BufferAttribute(sm, 1));
   sg.setAttribute('aCol', new THREE.BufferAttribute(sc, 3));
-  const starUniforms = { uStarI: { value: 0.35 } };
+  const starUniforms = { uStarI: { value: 0.35 }, uStarGamma: { value: 1 }, tDepth: { value: null }, uRes: { value: new THREE.Vector2(1, 1) }, uUseDepth: { value: 0 } };
   const stars = new THREE.Points(sg, new THREE.ShaderMaterial({
     uniforms: starUniforms, vertexShader: starVert, fragmentShader: starFrag,
     blending: THREE.AdditiveBlending, depthWrite: false, transparent: false,
@@ -1063,5 +1391,5 @@ export function createWorld(renderer, manager, lighting) {
   if (CLOUDS_ENABLED && location.protocol.startsWith('http')) {
     loadCloudModels(shared).catch((e) => console.warn('Cloud models unavailable, using procedural clouds:', e));
   }
-  return { scene, shared, tiles, update, starUniforms, textures: { dayTex, nightTex, cloudTex } };
+  return { scene, shared, tiles, update, starUniforms, stars, textures: { dayTex, cloudTex } };
 }
