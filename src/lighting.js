@@ -24,12 +24,23 @@ export const SUN_E = 20.0;
 // "infinitely far": filtering between a cloud texel and an empty one then fades the shadow out over
 // the texel instead of cutting it off at the texel's edge (blocky shadows).
 export const CLOUD_SHADOW_EMPTY = 0;
+// Full-moon irradiance on the ground, in the units of the night lights (not SUN_E: physically it
+// is SUN_E * 2.3e-6, but the lights are scaled for the eye, not for the sun). Tuned by eye against
+// astronaut full-moon photos: with towns in frame the auto exposure meters for them, and moonlit
+// land then reads clearly but stays well below the lights.
+export const MOON_E = 1.4;
+// night ambient: starlight + airglow. Physically ~0.4 % of the full moon (0.005), which left the
+// moonless night side black; 0.2 (user, 2026-11-13: "light up the night side a little bit") shows
+// the land and clouds as faint navy under the lights, as in long-exposure orbit photos.
+export const NIGHT_GLOW_E = 0.2;
 
 export class Lighting {
   constructor(renderer) {
     this.renderer = renderer;
     this.glsl = lightingGLSL;
     this.sunDir = new THREE.Vector3(1, 0, 0);
+    this.moonGain = 1;   // artistic boost of the moonlight (1 = calibrated)
+    this.nightBoost = 1; // night ambient multiplier, set by updateNightBoost
     const luts = createAtmosphereLUTs(renderer);
 
     // 1x1 "no occluder" stand-in until a cloud provider asks for the real map
@@ -39,14 +50,18 @@ export class Lighting {
     this.uniforms = {
       uSunDir: { value: this.sunDir },
       uSunE: { value: SUN_E },
+      uMoonDir: { value: new THREE.Vector3(0, 0, 1) },
+      uMoonE: { value: 0 },        // MOON_E * phase law * moonGain
+      uNightGlowE: { value: NIGHT_GLOW_E },
       uAtmo: { value: ATMOSPHERE_ENABLED ? 1 : 0 },
-      uAerial: { value: 0.55 },
+      uAerial: { value: 1.0 },     // air haze over the ground: physical (user choice 2026-11-13; B cycles 1/0.75/0.55/0.3)
       uTransLUT: { value: luts.transmittance },
       uMsLUT: { value: luts.multiScatter },
       uIrrLUT: { value: luts.irradiance },
       uCloudShadowMap: { value: this.emptyShadow },
       uCloudShadowMatrix: { value: new THREE.Matrix4() },
       uCloudShadowOn: { value: 0 },
+      uCloudShadowAlt: { value: 0 },  // provider writes the front altitude (cloudslot.js shadowAlt)
     };
 
     // cloud shadow map frame (valid while enabled); see updateShadowFrame()
@@ -69,15 +84,53 @@ export class Lighting {
 
   // Once per frame, before anything renders.
   update(sim) {
+    this.uniforms.uNightGlowE.value = NIGHT_GLOW_E * this.nightBoost;
     this.sunDir.copy(sim.sunDir);
     // solar irradiance follows the Earth-Sun distance (+-3.4 % over the year)
     this.uniforms.uSunE.value = SUN_E / (sim.sunDistAU * sim.sunDistAU);
+    this.uniforms.uMoonDir.value.copy(sim.moonDir);
+    this.uniforms.uMoonE.value = MOON_E * sim.moonPhase * this.moonGain;
   }
 
   get sunE() { return this.uniforms.uSunE.value; }
 
+  // Keeps the night side as bright on screen as at full night when daylight (or a sunlit
+  // spacecraft) is in frame and the auto exposure drops for it. ev: the exposure in use; maxEV: the
+  // exposure at full night. The boost itself brightens the night pixels the exposure meters (a
+  // log-average, 75 % compensated), which would lower the exposure and raise the boost again; that
+  // share, nightShare x log2(boost) x 0.75, is added back before the boost is worked out.
+  updateNightBoost(ev, maxEV, nightShare, dt) {
+    const ev0 = ev + 0.75 * nightShare * Math.log2(this.nightBoost);
+    const target = 2 ** THREE.MathUtils.clamp(maxEV - ev0, 0, 3);
+    this.nightBoost += (target - this.nightBoost) * (1 - Math.exp(-dt * 2));
+    this.uniforms.uNightGlowE.value = NIGHT_GLOW_E * this.nightBoost;
+  }
+
+  // Share of the Earth seen by the camera that is on the night side (coarse ray grid).
+  nightShareOf(camera) {
+    const v = this._v ||= new THREE.Vector3(), p = this._p ||= new THREE.Vector3(), o = camera.position;
+    let earth = 0, night = 0;
+    for (let j = 0; j < 6; j++) for (let i = 0; i < 10; i++) {
+      v.set((i + 0.5) / 5 - 1, (j + 0.5) / 3 - 1, 0.5).unproject(camera).sub(o).normalize();
+      const b = o.dot(v), h = b * b - o.dot(o) + R_EARTH * R_EARTH;
+      if (h < 0) continue;
+      const t = -b - Math.sqrt(h);
+      if (t < 0) continue;
+      earth++;
+      if (p.copy(o).addScaledVector(v, t).dot(this.sunDir) < 0) night++;
+    }
+    return earth ? night / earth : 0;
+  }
+
   // Colour of the sunlight arriving at a world point after the air (limb reddening, Earth shadow).
   // withClouds: also the cloud shadow -- only valid for the point given to setProbe().
+  // Moonlight reaching a point (scene units, same as the planet's uMoonE): the phase law, the air
+  // it crosses and the Earth hiding the moon, as sunColorAt does for the sun.
+  moonColorAt(posKm, out = new THREE.Color()) {
+    sunTransmittanceJS(posKm, this.uniforms.uMoonDir.value, out);
+    return out.multiplyScalar(this.uniforms.uMoonE.value);
+  }
+
   sunColorAt(posKm, out = new THREE.Color(), withClouds = false) {
     sunTransmittanceJS(posKm, this.sunDir, out);
     return withClouds ? out.multiplyScalar(this.probeT) : out;
@@ -145,7 +198,7 @@ export class Lighting {
     const r = this.renderer, gl = r.getContext();
     const prev = r.getRenderTarget();
     r.setRenderTarget(sh.target);
-    gl.clearBufferfv(gl.COLOR, 0, [CLOUD_SHADOW_EMPTY, 0, 0, 1]);
+    gl.clearBufferfv(gl.COLOR, 0, [CLOUD_SHADOW_EMPTY, 0, 0, 0]);
     r.setRenderTarget(prev);
   }
 
