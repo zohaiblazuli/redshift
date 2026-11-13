@@ -18,6 +18,9 @@ import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 //                           cloudShadowGLSL), cleared to "no cloud" (0, 0, 0). Every lit thing reads it.
 //   dispose()             on detach (optional)
 //   shadowMapSize         optional, default 2048
+//   shadowAlt             optional: the shadow map's alpha holds the altitude (km) where each texel's
+//                         sun ray enters the cloud, times its optical depth (b); 0 where empty.
+//                         Lets lookups drop shadows of clouds a low sun's ray passes over.
 //   renderScale           optional: colour target resolution relative to the frame (default 0.5)
 //   temporal              optional: the slot accumulates the clouds over frames (see below)
 //
@@ -130,9 +133,10 @@ export class CloudSlotPass extends Pass {
     this.color?.dispose(); this.color = null;
     for (const h of this.history) h.dispose();
     this.history = [];
-    if (!p) { this.lighting.setCloudShadowEnabled(false); return; }
+    if (!p) { this.lighting.setCloudShadowEnabled(false); this.lighting.uniforms.uCloudShadowAlt.value = 0; return; }
 
     this.lighting.setCloudShadowEnabled(true, p.shadowMapSize || 2048);
+    this.lighting.uniforms.uCloudShadowAlt.value = p.shadowAlt ? 1 : 0;
     this.scale = THREE.MathUtils.clamp(p.renderScale || 0.5, 0.1, 1);
     this.temporal = !!p.temporal;
     // colour (+ depth, location 1, for temporal providers)
