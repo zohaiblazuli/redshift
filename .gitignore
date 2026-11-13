@@ -23,3 +23,10 @@ Desktop.ini
 *.swp
 *.swo
 
+
+# Secrets
+earthdata_token.txt
+
+# Python bytecode
+__pycache__/
+*.pyc
